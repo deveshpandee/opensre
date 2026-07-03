@@ -86,6 +86,8 @@ class AgentRunResult:
     tool_results: list[tuple[ToolCall, ToolExecutionResult]] = field(default_factory=list)
     terminated_by_tool: bool = False
     hit_iteration_cap: bool = False
+    final_system_prompt: str = ""
+    """System prompt sent to the LLM on the last request (post-hook), for debugging."""
 
 
 # Backward-compat alias — callers that still reference ToolLoopResult compile unchanged.
@@ -143,6 +145,26 @@ class Agent[RuntimeToolT: RuntimeTool]:
             tool_hooks=tool_hooks,
         )
         return result
+
+    @staticmethod
+    def resolve_integrations(session: SessionStore) -> dict[str, Any]:
+        """Resolve integration configs for ``session``, using the session cache."""
+        # importlib keeps the core -> agent_harness reach dynamic (no static cycle).
+        resolution = importlib.import_module("core.agent_harness.integrations.resolution")
+        cache = importlib.import_module("core.agent_harness.session.integrations_cache")
+
+        cached = session.resolved_integrations_cache
+        if cached is not None and (
+            cache.has_resolved_integrations(cached) or not cache.has_only_runtime_metadata(cached)
+        ):
+            return dict(cached)
+
+        resolved = resolution.resolve_integrations()
+        if resolved:
+            session.resolved_integrations_cache = cache.merge_resolved_integrations(
+                cached, resolved
+            )
+        return dict(session.resolved_integrations_cache or {})
 
     def __init__(
         self,
@@ -227,6 +249,7 @@ class Agent[RuntimeToolT: RuntimeTool]:
         executed: list[tuple[ToolCall, Any]] = []
         tool_results: list[tuple[ToolCall, ToolExecutionResult]] = []
         final_text = ""
+        final_system_prompt = system
         hit_cap = True
         terminated_by_tool = False
         self._emit_runtime(
@@ -257,6 +280,7 @@ class Agent[RuntimeToolT: RuntimeTool]:
                 metadata={"iteration": iteration},
             )
             provider_request = self._before_provider_request(provider_request)
+            final_system_prompt = provider_request.system
             self._emit_runtime(
                 ProviderRequestStartEvent(
                     iteration=iteration,
@@ -401,6 +425,7 @@ class Agent[RuntimeToolT: RuntimeTool]:
             tool_results=tool_results,
             terminated_by_tool=terminated_by_tool,
             hit_iteration_cap=hit_cap,
+            final_system_prompt=final_system_prompt,
         )
         self._emit_runtime(
             AgentEndEvent(
