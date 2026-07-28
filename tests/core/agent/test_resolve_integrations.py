@@ -1,4 +1,4 @@
-"""Tests for Agent.resolve_integrations."""
+"""Tests for resolve_and_cache_integrations."""
 
 from __future__ import annotations
 
@@ -6,8 +6,8 @@ from typing import Any
 
 import pytest
 
-from core.agent import Agent
-from core.agent_harness.session import Session
+from core.agent_harness.session.integration_resolution import resolve_and_cache_integrations
+from surfaces.interactive_shell.session import Session
 
 
 def test_resolve_integrations_returns_cached_configs_without_lookup(
@@ -20,11 +20,11 @@ def test_resolve_integrations_returns_cached_configs_without_lookup(
         raise AssertionError("resolve_integrations() must not run on a cache hit")
 
     monkeypatch.setattr(
-        "core.agent_harness.integrations.resolution.resolve_integrations",
+        "core.agent_harness.session.integration_resolution.resolve_integrations",
         _unexpected,
     )
 
-    assert Agent.resolve_integrations(session) == {
+    assert resolve_and_cache_integrations(session) == {
         "slack": {"webhook_url": "https://example/hook"},
     }
 
@@ -34,32 +34,14 @@ def test_resolve_integrations_resolves_on_cache_miss_and_merges(
 ) -> None:
     session = Session()
     monkeypatch.setattr(
-        "core.agent_harness.integrations.resolution.resolve_integrations",
+        "core.agent_harness.session.integration_resolution.resolve_integrations",
         lambda *_args, **_kwargs: {"datadog": {"api_key": "dd-key"}},
     )
 
-    resolved = Agent.resolve_integrations(session)
+    resolved = resolve_and_cache_integrations(session)
 
     assert resolved == {"datadog": {"api_key": "dd-key"}}
     assert session.resolved_integrations_cache == {"datadog": {"api_key": "dd-key"}}
-
-
-def test_resolve_and_cache_integrations_delegates_to_agent(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from core.agent_harness.integrations.resolution import resolve_and_cache_integrations
-
-    session = Session()
-    calls: list[Session] = []
-
-    def _fake(session_arg: Session) -> dict[str, Any]:
-        calls.append(session_arg)
-        return {"github": {"token": "ghp_test"}}
-
-    monkeypatch.setattr(Agent, "resolve_integrations", staticmethod(_fake))
-
-    assert resolve_and_cache_integrations(session) == {"github": {"token": "ghp_test"}}
-    assert calls == [session]
 
 
 def test_resolve_integrations_does_not_cache_empty_resolve(
@@ -68,12 +50,36 @@ def test_resolve_integrations_does_not_cache_empty_resolve(
     # An empty resolve must not be cached, so a later turn can retry.
     session = Session()
     monkeypatch.setattr(
-        "core.agent_harness.integrations.resolution.resolve_integrations",
+        "core.agent_harness.session.integration_resolution.resolve_integrations",
         lambda *_args, **_kwargs: {},
     )
 
-    assert Agent.resolve_integrations(session) == {}
+    assert resolve_and_cache_integrations(session) == {}
     assert session.resolved_integrations_cache is None
+
+
+def test_resolve_integrations_honors_explicit_empty_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``{}`` is a forced no-integration world — do not live-resolve over it.
+
+    Turn oracles pin ``resolved_integrations: {}`` so gather cannot see the
+    developer's/CI real credentials. Treating that as a cache miss would let
+    Datadog/Sentry tools fire and fail ``must_not_call`` contracts.
+    """
+    session = Session()
+    session.resolved_integrations_cache = {}
+
+    def _unexpected(*_args: object, **_kwargs: object) -> dict[str, Any]:
+        raise AssertionError("resolve_integrations() must not run on explicit empty cache")
+
+    monkeypatch.setattr(
+        "core.agent_harness.session.integration_resolution.resolve_integrations",
+        _unexpected,
+    )
+
+    assert resolve_and_cache_integrations(session) == {}
+    assert session.resolved_integrations_cache == {}
 
 
 def test_resolve_integrations_reresolves_metadata_only_cache(
@@ -83,11 +89,11 @@ def test_resolve_integrations_reresolves_metadata_only_cache(
     session = Session()
     session.resolved_integrations_cache = {"_auth_token": "tok"}
     monkeypatch.setattr(
-        "core.agent_harness.integrations.resolution.resolve_integrations",
+        "core.agent_harness.session.integration_resolution.resolve_integrations",
         lambda *_args, **_kwargs: {"datadog": {"api_key": "dd-key"}},
     )
 
-    resolved = Agent.resolve_integrations(session)
+    resolved = resolve_and_cache_integrations(session)
 
     assert resolved["datadog"] == {"api_key": "dd-key"}
     assert session.resolved_integrations_cache["datadog"] == {"api_key": "dd-key"}

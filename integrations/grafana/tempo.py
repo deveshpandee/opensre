@@ -7,8 +7,8 @@ from typing import TYPE_CHECKING, Any
 
 import requests
 
-from platform.observability.errors import report_exception
-from platform.observability.otlp_trace import extract_span_attributes, parse_otlp_trace
+from platform.observability.errors.boundary import report_exception
+from platform.observability.otlp_parser import extract_span_attributes, parse_otlp_trace
 
 if TYPE_CHECKING:
     from integrations.grafana.base import GrafanaClientBase
@@ -52,7 +52,7 @@ class TempoMixin:
         }
 
         try:
-            data = self._make_request(url, params=params)
+            data = self._make_get_request(url, params=params)
             traces = data.get("traces", [])
 
             enriched_traces = []
@@ -113,6 +113,7 @@ class TempoMixin:
                 url,
                 headers=self._get_auth_headers(),
                 timeout=10,
+                verify=self._config.ssl_verify,
             )
             response.raise_for_status()
             return {"spans": parse_otlp_trace(response.json())}

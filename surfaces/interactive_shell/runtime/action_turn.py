@@ -7,35 +7,39 @@ core ``run_action_agent_turn``.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
 
 from rich.console import Console
 
-from core.agent_harness.agents.action_agent import ToolCallingDeps, run_action_agent_turn
-from core.agent_harness.models.turn_context import TurnContext
-from core.agent_harness.models.turn_results import ToolCallingTurnResult
+from core.agent_harness.error_reporting import DefaultErrorReporter
+from core.agent_harness.llm_resolution import default_llm_factory
 from core.agent_harness.ports import OutputSink
-from core.agent_harness.providers.default_providers import DefaultErrorReporter, DefaultToolProvider
-from core.agent_harness.session import Session
+from core.agent_harness.tools.tool_provider import DefaultToolProvider
+from core.agent_harness.turns.action_driver import ToolCallingDeps, run_action_agent_turn
+from core.agent_harness.turns.turn_plan import TurnPlan
+from core.agent_harness.turns.turn_results import ToolCallingTurnResult
 from core.execution import ToolExecutionHooks
 from surfaces.interactive_shell.command_registry import SLASH_COMMANDS
 from surfaces.interactive_shell.command_registry.suggestions import resolve_literal_slash_typo
 from surfaces.interactive_shell.runtime.agent_harness_adapters import resolve_output_sink
+from surfaces.interactive_shell.runtime.background import runner as background_runner
+from surfaces.interactive_shell.runtime.investigation_adapter import (
+    repl_investigation_launch_ports,
+)
+from surfaces.interactive_shell.runtime.llm_provider_adapter import (
+    repl_llm_provider_ports,
+)
+from surfaces.interactive_shell.runtime.slash_adapter import (
+    repl_slash_ports,
+)
+from surfaces.interactive_shell.runtime.subprocess_runner.repl_presenter import (
+    ReplSubprocessPresenter,
+)
+from surfaces.interactive_shell.runtime.task_cancel_adapter import (
+    repl_task_cancel_ports,
+)
+from surfaces.interactive_shell.session import Session
 from surfaces.interactive_shell.ui.action_rendering import ActionRenderObserver
-
-
-def _default_llm_factory() -> Any:
-    from core.llm import agent_llm_client
-
-    return agent_llm_client.get_agent_llm()
-
-
-def _action_observer_factory(
-    session: Session,
-    console: Console,
-    message: str,
-) -> ActionRenderObserver:
-    return ActionRenderObserver(session=session, console=console, message=message)
+from tools.interactive_shell.shared.investigation_launch import InvestigationLaunchPorts
 
 
 def _complete_literal_slash_typo_turn(
@@ -59,6 +63,29 @@ def _complete_literal_slash_typo_turn(
     return ToolCallingTurnResult(0, 1, 0, False, True, response_text=typo.message)
 
 
+def _subprocess_presenter_factory(
+    session: Session,
+    console: Console,
+    confirm_fn: Callable[[str], str] | None,
+    is_tty: bool | None,
+    action_already_listed: bool,
+) -> ReplSubprocessPresenter:
+    return ReplSubprocessPresenter(
+        session,
+        console,
+        confirm_fn=confirm_fn,
+        is_tty=is_tty,
+        action_already_listed=action_already_listed,
+    )
+
+
+def _investigation_ports_factory() -> InvestigationLaunchPorts:
+    return repl_investigation_launch_ports(
+        start_background_text=background_runner.start_background_text_investigation,
+        start_background_sample=background_runner.start_background_template_investigation,
+    )
+
+
 def run_action_tool_turn(
     message: str,
     session: Session,
@@ -68,7 +95,7 @@ def run_action_tool_turn(
     is_tty: bool | None = None,
     request_exit: Callable[[], None] | None = None,
     deps: ToolCallingDeps | None = None,
-    turn_ctx: TurnContext | None = None,
+    turn_plan: TurnPlan | None = None,
     output: OutputSink | None = None,
     tool_hooks: ToolExecutionHooks | None = None,
 ) -> ToolCallingTurnResult:
@@ -80,7 +107,7 @@ def run_action_tool_turn(
     effective_deps = (
         deps
         if deps is not None and deps.llm_factory is not None
-        else ToolCallingDeps(llm_factory=_default_llm_factory)
+        else ToolCallingDeps(llm_factory=default_llm_factory)
     )
     return run_action_agent_turn(
         message,
@@ -90,12 +117,19 @@ def run_action_tool_turn(
             session,
             console,
             request_exit=request_exit,
-            observer_factory=_action_observer_factory,
+            observer_factory=lambda msg: ActionRenderObserver(
+                session=session, console=console, message=msg
+            ),
+            subprocess_presenter_factory=_subprocess_presenter_factory,
+            investigation_ports_factory=_investigation_ports_factory,
+            llm_provider_ports_factory=repl_llm_provider_ports,
+            task_cancel_ports_factory=repl_task_cancel_ports,
+            slash_ports_factory=repl_slash_ports,
         ),
         confirm_fn=confirm_fn,
         is_tty=is_tty,
         deps=effective_deps,
-        turn_ctx=turn_ctx,
+        turn_plan=turn_plan,
         error_reporter=DefaultErrorReporter(),
         tool_hooks=tool_hooks,
     )

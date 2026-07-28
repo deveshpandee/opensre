@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from core.context.state import InvestigationState
+from core.state import InvestigationState
 from tools.investigation.reporting.context.evidence_catalog import (
     attach_evidence_to_claims,
     build_evidence_catalog,
@@ -35,12 +35,17 @@ def build_report_context(state: InvestigationState) -> ReportContext:
 
     return {
         # Core RCA results
-        "pipeline_name": state.get("pipeline_name", "unknown"),
         "alert_name": state.get("alert_name"),
         "root_cause": state.get("root_cause", ""),
         "validated_claims": validated_claims,
         "non_validated_claims": non_validated_claims,
         "remediation_steps": state.get("remediation_steps", []),
+        "triage_summary": state.get("triage_summary", ""),
+        "incident_status": state.get("incident_status", ""),
+        "investigation_hypotheses": state.get("investigation_hypotheses", []),
+        "verification_summary": state.get("verification_summary", []),
+        "follow_up_questions": state.get("follow_up_questions", []),
+        "remediation_tradeoffs": state.get("remediation_tradeoffs", ""),
         "correlation": state.get("correlation", {}),
         # S3 verification
         "s3_marker_exists": ns.s3.get("marker_exists", False),

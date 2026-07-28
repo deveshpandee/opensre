@@ -18,7 +18,7 @@ import httpx
 
 from integrations.config_models import VercelIntegrationConfig
 from integrations.probes import ProbeResult
-from platform.observability.service_errors import capture_service_error
+from platform.observability.errors.service import capture_service_error
 from platform.observability.streaming import StreamingParseStats
 
 logger = logging.getLogger(__name__)
@@ -31,12 +31,6 @@ _DEFAULT_TIMEOUT = 30
 # Runtime logs can take a long time (large limit, slow server-side aggregation, stream+json).
 _RUNTIME_LOGS_READ_ATTEMPTS = 3
 _RUNTIME_LOGS_READ_TIMEOUT_DEFAULT = 600.0
-
-
-def _scrub_log_fragment(value: object) -> str:
-    """Make user-controlled strings safe for single-line log records (avoid log injection)."""
-    text = str(value)
-    return text.replace("\r", "\\r").replace("\n", "\\n")
 
 
 def _safe_vercel_path_segment(raw: str) -> str | None:

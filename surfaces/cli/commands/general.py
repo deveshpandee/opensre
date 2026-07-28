@@ -9,7 +9,7 @@ import time
 import click
 
 import platform
-from config.version import get_version
+from config.version import get_opensre_version
 from platform.analytics.cli import (
     capture_update_completed,
     capture_update_failed,
@@ -64,7 +64,7 @@ def version_command() -> None:
         click.echo(
             json.dumps(
                 {
-                    "opensre": get_version(),
+                    "opensre": get_opensre_version(),
                     "python": platform.python_version(),
                     "os": platform.system().lower(),
                     "arch": platform.machine(),
@@ -72,7 +72,7 @@ def version_command() -> None:
             )
         )
         return
-    click.echo(f"opensre {get_version()}")
+    click.echo(f"opensre {get_opensre_version()}")
     click.echo(f"Python  {platform.python_version()}")
     click.echo(f"OS      {platform.system().lower()} ({platform.machine()})")
 
@@ -85,7 +85,7 @@ def version_command() -> None:
 def health_command(watch: bool, rate: int) -> None:
     """Show a quick health summary of the local agent setup."""
     from config.config import get_environment
-    from integrations.store import STORE_PATH
+    from config.constants.paths import integrations_store_path
     from integrations.verify import verify_integrations
     from surfaces.interactive_shell.ui.health import render_health_json, render_health_report
 
@@ -96,7 +96,7 @@ def health_command(watch: bool, rate: int) -> None:
         if is_json_output():
             render_health_json(
                 environment=environment,
-                integration_store_path=STORE_PATH,
+                integration_store_path=integrations_store_path(),
                 results=results,
             )
         else:
@@ -105,7 +105,7 @@ def health_command(watch: bool, rate: int) -> None:
             render_health_report(
                 console=Console(highlight=False),
                 environment=environment,
-                integration_store_path=STORE_PATH,
+                integration_store_path=integrations_store_path(),
                 results=results,
             )
 
@@ -174,8 +174,8 @@ def investigate_command(
 
     from surfaces.cli import write_json
     from surfaces.cli.investigation import run_investigation_cli, run_investigation_cli_streaming
-    from surfaces.cli.investigation.alert_templates import build_alert_template
     from surfaces.cli.investigation.payload import load_payload
+    from tools.investigation.alert_templates import build_alert_template
 
     try:
         if print_template:
@@ -199,7 +199,7 @@ def investigate_command(
             input_json=input_json,
             interactive=interactive,
             evaluate_requested=evaluate,
-        ):
+        ) as tracker:
             # Only stream the live UI when the user is interactively watching stdout
             # and hasn't asked for machine-readable JSON. Otherwise the spinner and
             # ANSI control codes corrupt the JSON payload that consumers expect on
@@ -210,7 +210,7 @@ def investigate_command(
                 sys.stdout.isatty() and not is_json_output() and output is None and not evaluate
             )
             if stream_to_stdout:
-                run_investigation_cli_streaming(raw_alert=payload)
+                run_investigation_cli_streaming(raw_alert=payload, tracker=tracker)
             else:
                 result = run_investigation_cli(raw_alert=payload, opensre_evaluate=evaluate)
                 write_json(result, output)

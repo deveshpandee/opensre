@@ -7,7 +7,6 @@ import io
 import pytest
 from rich.console import Console
 
-from core.agent_harness.session import Session
 from surfaces.interactive_shell.command_registry import SLASH_COMMANDS, dispatch_slash
 from surfaces.interactive_shell.command_registry.suggestions import (
     format_invalid_subcommand_message,
@@ -16,6 +15,7 @@ from surfaces.interactive_shell.command_registry.suggestions import (
     subcommand_hints,
 )
 from surfaces.interactive_shell.runtime.action_turn import run_action_tool_turn
+from surfaces.interactive_shell.session import Session
 
 
 def _capture() -> tuple[Console, io.StringIO]:
@@ -75,6 +75,22 @@ def test_dispatch_invalid_subcommand_is_handled_by_command_handler(
     assert dispatch_slash("/integrations bogus", session, console) is True
     assert "unknown subcommand" in buf.getvalue().lower()
     assert resolve_literal_slash_typo("/integrations bogus", SLASH_COMMANDS) is None
+
+
+@pytest.mark.parametrize("command_line", ["/integrations bogus", "/mcp bogus"])
+def test_dispatch_unknown_subcommand_records_turn_as_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    command_line: str,
+) -> None:
+    monkeypatch.setattr(
+        "surfaces.interactive_shell.command_registry.integrations.repl_data.load_verified_integrations",
+        lambda: [],
+    )
+    session = Session()
+    console, buf = _capture()
+    assert dispatch_slash(command_line, session, console, is_tty=False) is True
+    assert "unknown subcommand" in buf.getvalue().lower()
+    assert session.history[-1]["ok"] is False
 
 
 def test_subcommand_hints_ignores_usage_placeholders() -> None:

@@ -94,9 +94,10 @@ INTEGRATION_SPECS: tuple[IntegrationSpec, ...] = (
     ),
     IntegrationSpec(
         service="gitlab",
+        has_verifier=True,
         direct_effective=True,
         setup_order=15,
-        verify_order=None,
+        verify_order=52,
     ),
     IntegrationSpec(
         service="jenkins",
@@ -189,8 +190,17 @@ INTEGRATION_SPECS: tuple[IntegrationSpec, ...] = (
     ),
     IntegrationSpec(
         service="jira",
+        has_verifier=True,
         direct_effective=True,
-        verify_order=None,
+        verify_order=50,
+    ),
+    IntegrationSpec(
+        service="servicenow",
+        aliases=("service now", "service-now"),
+        has_verifier=True,
+        direct_effective=True,
+        setup_order=42,
+        verify_order=56,
     ),
     IntegrationSpec(
         service="discord",
@@ -205,6 +215,14 @@ INTEGRATION_SPECS: tuple[IntegrationSpec, ...] = (
         direct_effective=True,
         setup_order=26,
         verify_order=26,
+    ),
+    IntegrationSpec(
+        service="rocketchat",
+        aliases=("rocket.chat", "rocket chat"),
+        has_verifier=True,
+        direct_effective=True,
+        setup_order=41,
+        verify_order=55,
     ),
     IntegrationSpec(
         service="whatsapp",
@@ -336,9 +354,16 @@ INTEGRATION_SPECS: tuple[IntegrationSpec, ...] = (
     IntegrationSpec(
         service="slack",
         has_verifier=True,
-        skip_classification=True,
+        direct_effective=True,
         setup_order=9,
         verify_order=8,
+    ),
+    IntegrationSpec(
+        service="railway",
+        has_verifier=True,
+        direct_effective=True,
+        setup_order=43,
+        verify_order=57,
     ),
     IntegrationSpec(
         service="smtp",
@@ -358,8 +383,14 @@ INTEGRATION_SPECS: tuple[IntegrationSpec, ...] = (
     IntegrationSpec(service="clickhouse", has_verifier=True, verify_order=23),
     IntegrationSpec(service="alicloud", direct_effective=True),
     IntegrationSpec(service="notion"),
-    IntegrationSpec(service="prefect"),
-    IntegrationSpec(service="posthog"),
+    IntegrationSpec(service="prefect", has_verifier=True, verify_order=51),
+    IntegrationSpec(
+        service="posthog",
+        has_verifier=True,
+        direct_effective=True,
+        setup_order=40,
+        verify_order=54,
+    ),
     IntegrationSpec(service="trello"),
     IntegrationSpec(service="rds", setup_order=11),
     IntegrationSpec(
@@ -394,6 +425,15 @@ INTEGRATION_SPECS: tuple[IntegrationSpec, ...] = (
         direct_effective=True,
         setup_order=37,
         verify_order=48,
+    ),
+    IntegrationSpec(
+        service="kubernetes",
+        aliases=("k8s",),
+        has_verifier=True,
+        direct_effective=True,
+        core_verify=True,
+        setup_order=51,
+        verify_order=53,
     ),
 )
 
@@ -447,7 +487,8 @@ def family_key(service_key: str) -> str:
 
 # Wire the concrete resolver into the platform-level seam so callers in
 # ``tools/`` can normalize service keys without importing from
-# ``integrations/`` directly (T-4 layering audit, issue #3352, item 27).
+# ``integrations/`` directly, keeping ``platform/`` free of a reverse
+# dependency on ``integrations/``.
 # Kept at import time so any consumer that has already imported the
 # ``integrations`` package (every CLI entry point does so during startup)
 # sees the real mapping instead of the identity fallback.
@@ -467,23 +508,18 @@ def service_key(service_name: str) -> str:
 
 
 # Aliases that apply only to the integration-management commands (setup, verify,
-# show, remove). These intentionally diverge from `service_key` / `SERVICE_KEY_MAP`,
-# which must keep `posthog` distinct from `posthog_mcp` for classification: the
-# bare `posthog` integration is env-configured analytics with no interactive
-# setup/verify flow of its own, so when a user (or the action planner) asks to
-# *manage* "posthog" the only real target is the PostHog MCP integration.
-MANAGEMENT_SERVICE_ALIASES: dict[str, str] = {
-    "posthog": "posthog_mcp",
-}
+# show, remove). These intentionally diverge from `service_key` / `SERVICE_KEY_MAP`
+# when a user-facing label should map to a different canonical handler. Like
+# Sentry, bare ``posthog`` is the REST credentials integration and ``posthog_mcp``
+# is the separate MCP flow — they are not aliased to each other.
+MANAGEMENT_SERVICE_ALIASES: dict[str, str] = {}
 
 
 def resolve_management_service(service_name: str) -> str:
     """Resolve a service token for the integration-management CLI commands.
 
     Layers management-only aliases on top of the global `service_key`
-    normalization so commands like ``integrations setup posthog`` resolve to the
-    canonical ``posthog_mcp`` flow instead of failing the ``click.Choice`` enum
-    check before the handler ever runs.
+    normalization when a CLI label should map to a different canonical handler.
     """
     lowered = service_name.strip().lower()
     aliased = MANAGEMENT_SERVICE_ALIASES.get(lowered)

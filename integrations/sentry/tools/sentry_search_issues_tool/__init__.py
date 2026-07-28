@@ -8,13 +8,22 @@ import httpx
 
 from core.tool_framework.telemetry import report_run_error
 from core.tool_framework.tool_decorator import tool
+from core.tool_framework.utils.tool_availability import tool_unavailable
 from integrations.sentry import (
     DEFAULT_SENTRY_ISSUE_LIMIT,
     SentryConfig,
+    _resolve_stats_period,
     build_sentry_config,
     describe_sentry_api_error,
     list_sentry_issues,
     sentry_config_from_env,
+)
+from integrations.sentry.issue_digest import (
+    build_sentry_issue_digest,
+    business_impact_score,
+    classify_issue,
+    slim_issue,
+    structural_cluster_key_for_issue,
 )
 
 
@@ -107,12 +116,7 @@ def search_sentry_issues(
     """Search Sentry issues related to an incident or failure signature."""
     config = _resolve_config(sentry_url, organization_slug, sentry_token, project_slug)
     if config is None:
-        return {
-            "source": "sentry",
-            "available": False,
-            "error": "Sentry integration is not configured.",
-            "issues": [],
-        }
+        return tool_unavailable("sentry", "Sentry integration is not configured.", issues=[])
 
     try:
         issues = list_sentry_issues(
@@ -133,17 +137,16 @@ def search_sentry_issues(
                 "status_code": err.response.status_code,
             },
         )
-        return {
-            "source": "sentry",
-            "available": False,
-            "error": describe_sentry_api_error(
+        return tool_unavailable(
+            "sentry",
+            describe_sentry_api_error(
                 err,
                 query=query,
                 project_slug=config.project_slug,
             ),
-            "issues": [],
-            "query": query,
-        }
+            issues=[],
+            query=query,
+        )
     except Exception as err:
         report_run_error(
             err,
@@ -153,12 +156,47 @@ def search_sentry_issues(
             method="list_sentry_issues",
             extras={"query": query, "organization_slug": config.organization_slug},
         )
-        return {
-            "source": "sentry",
-            "available": False,
-            "error": f"Sentry issue search failed: {err}",
-            "issues": [],
-            "query": query,
-        }
+        return tool_unavailable(
+            "sentry", f"Sentry issue search failed: {err}", issues=[], query=query
+        )
 
-    return {"source": "sentry", "available": True, "issues": issues, "query": query}
+    return _search_result_payload(issues, query=query, stats_period=stats_period, page_limit=limit)
+
+
+def _search_result_payload(
+    issues: list[dict[str, Any]],
+    *,
+    query: str,
+    stats_period: str,
+    page_limit: int,
+) -> dict[str, Any]:
+    effective_period = _resolve_stats_period(stats_period or None)
+    digest = build_sentry_issue_digest(
+        issues,
+        stats_period=effective_period,
+        query=query,
+        page_limit=page_limit,
+    )
+    sample_limit = 15
+    sample = []
+    for issue in issues[:sample_limit]:
+        structural_cluster = structural_cluster_key_for_issue(issue)
+        impact_score, impact_reasons = business_impact_score(issue)
+        sample.append(
+            slim_issue(
+                issue,
+                structural_cluster=structural_cluster,
+                classification=classify_issue(issue),
+                impact_score=impact_score,
+                impact_reasons=impact_reasons,
+            )
+        )
+    return {
+        "source": "sentry",
+        "available": True,
+        "query": query,
+        "stats_period": effective_period,
+        "issues_total": len(issues),
+        "digest": digest,
+        "issues": sample,
+    }

@@ -9,16 +9,16 @@ import pytest
 from rich.console import Console
 from rich.table import Table
 
-from core.agent_harness.session import Session
 from surfaces.interactive_shell.command_registry import SLASH_COMMANDS, dispatch_slash
 from surfaces.interactive_shell.command_registry.agents import core as agents_core
 from surfaces.interactive_shell.command_registry.agents import trace as agents_trace
 from surfaces.interactive_shell.command_registry.agents.conflicts_view import render_conflicts
 from surfaces.interactive_shell.command_registry.agents.trace import _slice_to_utf8_boundary
-from tools.fleet_monitoring import config as config_mod
-from tools.fleet_monitoring.conflicts import DEFAULT_WINDOW_SECONDS, FileWriteConflict
-from tools.fleet_monitoring.registry import AgentRecord, AgentRegistry
-from tools.fleet_monitoring.tail import AttachUnsupported, TailBuffer
+from surfaces.interactive_shell.session import Session
+from tools.system.fleet_monitoring import config as config_mod
+from tools.system.fleet_monitoring.conflicts import DEFAULT_WINDOW_SECONDS, FileWriteConflict
+from tools.system.fleet_monitoring.registry import AgentRecord, AgentRegistry
+from tools.system.fleet_monitoring.tail import AttachUnsupported, TailBuffer
 
 
 def _capture() -> tuple[Console, io.StringIO]:
@@ -64,8 +64,8 @@ def _clear_sampler_module_state() -> None:
     probe snapshots, the token rate tracker, and the per-tick caches
     all live as module globals and can leak across test files.
     """
-    from tools.fleet_monitoring import sampler as sampler_mod
-    from tools.fleet_monitoring.token_rate import TOKEN_RATE_TRACKER
+    from tools.system.fleet_monitoring import sampler as sampler_mod
+    from tools.system.fleet_monitoring.token_rate import TOKEN_RATE_TRACKER
 
     sampler_mod._latest.clear()
     sampler_mod._TickCache.registry_snapshot = {}

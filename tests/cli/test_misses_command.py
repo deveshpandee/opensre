@@ -22,14 +22,21 @@ _SEED_TIMESTAMP = (datetime.now(UTC) - timedelta(days=2)).isoformat()
 def opensre_home(monkeypatch, tmp_path: Path) -> Path:
     home = tmp_path / ".opensre"
     monkeypatch.setattr("config.constants.OPENSRE_HOME_DIR", home)
+    monkeypatch.setattr("config.constants.paths.OPENSRE_HOME_DIR", home)
     return home
 
 
-def _seed(alert: str, taxonomy: MissTaxonomy, *, feedback_id: str = "fb") -> dict:
+def _seed(
+    alert: str,
+    taxonomy: MissTaxonomy,
+    *,
+    feedback_id: str = "fb",
+    timestamp: str | None = None,
+) -> dict:
     return record_miss(
         {
             "feedback_id": feedback_id,
-            "timestamp": _SEED_TIMESTAMP,
+            "timestamp": timestamp or _SEED_TIMESTAMP,
             "run_id": f"run-{feedback_id}",
             "alert_name": alert,
             "rating": "inaccurate",

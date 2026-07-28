@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Any
 
 from core.tool_framework.tool_decorator import tool
+from core.tool_framework.utils.tool_availability import tool_unavailable
 from integrations.groundcover.availability import groundcover_available_or_backend
 from integrations.groundcover.client import GroundcoverClient
 from integrations.groundcover.helpers import (
@@ -44,7 +45,6 @@ def _logs_extract_params(sources: dict[str, dict]) -> dict[str, Any]:
     display_name="groundcover logs",
     source="groundcover",
     tags=("logs", "observability"),
-    cost_tier="moderate",
     description=(
         "Search groundcover logs with gcQL. Use for application errors, exceptions, and service "
         "log events. " + GCQL_GUIDANCE + " Discover fields with '* | field_names' or by calling "
@@ -129,7 +129,6 @@ def _query_ref_extract_params(sources: dict[str, dict]) -> dict[str, Any]:
     display_name="groundcover query reference",
     source="groundcover",
     tags=("observability", "reference"),
-    cost_tier="cheap",
     surfaces=("investigation", "chat"),
     description=(
         "Get the groundcover Query Language (gcQL) reference: operators, functions, pipes, and "
@@ -156,20 +155,14 @@ def get_groundcover_query_reference(
         return cast("dict[str, Any]", groundcover_backend.get_query_reference())
 
     if _groundcover_client is None:
-        return {
-            "source": _QUERY_REF_SOURCE,
-            "available": False,
-            "reference": "",
-            "error": "groundcover integration not configured",
-        }
+        return tool_unavailable(
+            _QUERY_REF_SOURCE, "groundcover integration not configured", reference=""
+        )
     result = _groundcover_client.get_query_reference()
     if not result.get("success"):
-        return {
-            "source": _QUERY_REF_SOURCE,
-            "available": False,
-            "reference": "",
-            "error": result.get("error", "could not fetch gcQL reference"),
-        }
+        return tool_unavailable(
+            _QUERY_REF_SOURCE, result.get("error", "could not fetch gcQL reference"), reference=""
+        )
     return {
         "source": _QUERY_REF_SOURCE,
         "available": True,
@@ -220,7 +213,6 @@ def _traces_extract_params(sources: dict[str, dict]) -> dict[str, Any]:
     display_name="groundcover traces",
     source="groundcover",
     tags=("traces", "observability"),
-    cost_tier="moderate",
     description=(
         "Query groundcover traces/spans with gcQL. Use to find slow spans, failing spans, and "
         "request correlations across services. " + GCQL_GUIDANCE + " Discover fields with "

@@ -9,12 +9,13 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from core.context_budget import strip_internal_message_markers
 from core.domain.diagnosis.alignment import apply_category_alignment_adjustments
-from core.domain.types.root_cause_categories import (
-    HERMES_ROOT_CAUSE_CATEGORIES,
-    VALID_ROOT_CAUSE_CATEGORIES,
-    render_prompt_taxonomy,
+from core.domain.diagnosis.taxonomy_registry import (
+    root_cause_category_instruction_for_source,
+    taxonomy_categories_for_alert_source,
 )
+from core.domain.types.root_cause_categories import render_prompt_taxonomy
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,12 @@ class InvestigationResult:
     non_validated_claims: list[dict] = field(default_factory=list)
     remediation_steps: list[str] = field(default_factory=list)
     validity_score: float = 0.0
+    triage_summary: str = ""
+    incident_status: str = ""
+    investigation_hypotheses: list[str] = field(default_factory=list)
+    verification_summary: list[str] = field(default_factory=list)
+    follow_up_questions: list[str] = field(default_factory=list)
+    remediation_tradeoffs: str = ""
     evidence: dict[str, Any] = field(default_factory=dict)
     evidence_entries: list[dict] = field(default_factory=list)
     agent_messages: list[dict] = field(default_factory=list)
@@ -86,61 +93,20 @@ def result_to_state(result: InvestigationResult) -> dict[str, Any]:
         "non_validated_claims": result.non_validated_claims,
         "remediation_steps": result.remediation_steps,
         "validity_score": result.validity_score,
+        "triage_summary": result.triage_summary,
+        "incident_status": result.incident_status,
+        "investigation_hypotheses": result.investigation_hypotheses,
+        "verification_summary": result.verification_summary,
+        "follow_up_questions": result.follow_up_questions,
+        "remediation_tradeoffs": result.remediation_tradeoffs,
         "investigation_recommendations": result.investigation_recommendations,
         "evidence": result.evidence,
         "evidence_entries": result.evidence_entries,
-        "agent_messages": result.agent_messages,
+        # Diagnose is the last stage to read agent_messages — the context-budget
+        # eviction markers on it (_opensre_seed, _opensre_duplicate_result) have
+        # already served their purpose and must not leak into persisted state.
+        "agent_messages": strip_internal_message_markers(result.agent_messages),
     }
-
-
-def extract_last_assistant_text(messages: list[dict[str, Any]]) -> str:
-    for msg in reversed(messages):
-        if msg.get("role") != "assistant":
-            continue
-        content = msg.get("content", "")
-        if isinstance(content, str) and content.strip():
-            return content.strip()
-        if isinstance(content, list):
-            parts: list[str] = []
-            for block in content:
-                if isinstance(block, str):
-                    parts.append(block)
-                    continue
-                if isinstance(block, dict):
-                    if block.get("type") == "text" and isinstance(block.get("text"), str):
-                        parts.append(block["text"])
-                    continue
-                block_type = getattr(block, "type", None)
-                block_text = getattr(block, "text", None)
-                if block_type == "text" and isinstance(block_text, str):
-                    parts.append(block_text)
-            text = " ".join(p for p in parts if p).strip()
-            if text:
-                return text
-    return ""
-
-
-def taxonomy_categories_for_alert_source(alert_source: str) -> set[str]:
-    source = alert_source.strip().lower()
-    if source == "hermes":
-        return set(HERMES_ROOT_CAUSE_CATEGORIES | {"healthy", "unknown"})
-    return set(VALID_ROOT_CAUSE_CATEGORIES - HERMES_ROOT_CAUSE_CATEGORIES)
-
-
-def root_cause_category_instruction_for_source(alert_source: str) -> str:
-    categories = taxonomy_categories_for_alert_source(alert_source)
-    taxonomy = render_prompt_taxonomy(categories).strip()
-    if alert_source.strip().lower() == "hermes":
-        return (
-            "Use exactly one category name from the Hermes taxonomy below\n\n"
-            "## Hermes root cause category taxonomy (single source of truth)\n"
-            f"{taxonomy}"
-        )
-    return (
-        "Use exactly one category name from the root cause taxonomy below\n\n"
-        "## Root cause category taxonomy (single source of truth)\n"
-        f"{taxonomy}"
-    )
 
 
 def normalize_root_cause_category(raw: str, *, allowed_categories: set[str]) -> str:
@@ -189,6 +155,30 @@ def build_diagnosis_schema(include_categories: set[str]) -> type[BaseModel]:
         remediation_steps: list[str] = Field(
             default_factory=list, description="Concrete remediation actions in order"
         )
+        triage_summary: str = Field(
+            default="",
+            description="One-line triage complete scope summary",
+        )
+        incident_status: str = Field(
+            default="",
+            description="Status block: confirmed | open | next | owner",
+        )
+        investigation_hypotheses: list[str] = Field(
+            default_factory=list,
+            description="Numbered hypotheses with confirm/rule-out criteria",
+        )
+        verification_summary: list[str] = Field(
+            default_factory=list,
+            description="Which verification tools/results tested which hypothesis",
+        )
+        follow_up_questions: list[str] = Field(
+            default_factory=list,
+            description="Direct follow-up questions for responders (each ending with ?)",
+        )
+        remediation_tradeoffs: str = Field(
+            default="",
+            description="Remediation trade-off analysis or N/A for a single fix path",
+        )
         validity_score: float = Field(
             default=0.0, description="0.0–1.0 confidence in the diagnosis"
         )
@@ -210,6 +200,12 @@ def build_investigation_result(
     remediation_steps: list[str],
     validity_score: float,
     alert_source: str = "",
+    triage_summary: str = "",
+    incident_status: str = "",
+    investigation_hypotheses: list[str] | None = None,
+    verification_summary: list[str] | None = None,
+    follow_up_questions: list[str] | None = None,
+    remediation_tradeoffs: str = "",
 ) -> InvestigationResult:
     normalized_category = normalize_root_cause_category(
         root_cause_category,
@@ -229,7 +225,26 @@ def build_investigation_result(
         non_validated_claims=claims_to_dicts(non_validated_claims, "not_validated"),
         remediation_steps=remediation_steps,
         validity_score=score,
+        triage_summary=triage_summary,
+        incident_status=incident_status,
+        investigation_hypotheses=list(investigation_hypotheses or []),
+        verification_summary=list(verification_summary or []),
+        follow_up_questions=list(follow_up_questions or []),
+        remediation_tradeoffs=remediation_tradeoffs,
         investigation_recommendations=recommendations,
         category_text_mismatch=mismatch,
         category_text_mismatch_reason=reason,
     )
+
+
+__all__ = [
+    "InvestigationResult",
+    "build_diagnosis_schema",
+    "build_investigation_result",
+    "claims_to_dicts",
+    "normalize_root_cause_category",
+    "result_to_state",
+    # Re-exported for compat — canonical home is taxonomy_registry.
+    "root_cause_category_instruction_for_source",
+    "taxonomy_categories_for_alert_source",
+]

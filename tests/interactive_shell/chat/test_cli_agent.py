@@ -18,6 +18,7 @@ from typing import Any
 
 from rich.console import Console
 
+from core.agent_harness.prompts import prompt_context as default_prompt_context
 from core.agent_harness.prompts.assistant_agent_prompt import (
     _MARKDOWN_RULE,
     _TERMINOLOGY_RULE,
@@ -25,11 +26,10 @@ from core.agent_harness.prompts.assistant_agent_prompt import (
     _build_system_prompt,
     build_environment_block,
 )
-from core.agent_harness.providers import default_prompt_context
-from core.agent_harness.providers.default_prompt_context import DefaultPromptContextProvider
-from core.agent_harness.session import Session
+from core.agent_harness.prompts.prompt_context import DefaultPromptContextProvider
 from surfaces.interactive_shell.runtime import answer_turn as cli_agent
 from surfaces.interactive_shell.runtime.answer_turn import answer_shell_question
+from surfaces.interactive_shell.session import Session
 
 
 def _build_environment_block(session: Session) -> str:
@@ -81,10 +81,9 @@ class _FakeLLMClient:
 def _patch_llm(monkeypatch: Any, content: Any) -> _FakeLLMClient:
     client = _FakeLLMClient(content)
     # ``answer_shell_question`` imports ``get_llm_for_reasoning`` lazily from
-    # ``core.llm.llm_client``, so we patch the symbol on that module.
-    import core.llm.llm_client as llm_module
+    # ``core.llm.factory.get_llm``, so we patch the symbol on that module.
 
-    monkeypatch.setattr(llm_module, "get_llm_for_reasoning", lambda: client)
+    monkeypatch.setattr("core.llm.factory.get_llm", lambda _role: client)
     return client
 
 
@@ -301,8 +300,8 @@ class TestObservationSummaryBlock:
         assert "tool_results" in block
         assert "- sentry: missing (Not configured.)" in block
         assert "summarize" in block.lower()
-        # The summary turn must not kick off more actions.
-        assert "not request, plan, or emit any further actions" in block.lower()
+        # The summary turn must not kick off more tool calls; offers are prose only.
+        assert "not request, plan, or emit any further tool calls" in block.lower()
 
     def test_answer_shell_question_injects_observation(self, monkeypatch: Any) -> None:
         client = _patch_llm(monkeypatch, "No — Sentry is not configured.")
@@ -400,11 +399,9 @@ class TestAssistantOutputRendering:
                 raise RuntimeError("upstream 503")
                 yield  # pragma: no cover  -- generator marker
 
-        import core.llm.llm_client as llm_module
-
-        monkeypatch.setattr(llm_module, "get_llm_for_reasoning", lambda: _Boom())
+        monkeypatch.setattr("core.llm.factory.get_llm", lambda _role: _Boom())
         monkeypatch.setattr(
-            "core.agent_harness.providers.default_providers.capture_exception",
+            "core.agent_harness.error_reporting.capture_exception",
             lambda exc, **_kwargs: captured_errors.append(exc),
         )
         session = Session()
@@ -436,9 +433,7 @@ class TestStreamingMigration:
                 calls.append("invoke_stream")
                 yield "ok"
 
-        import core.llm.llm_client as llm_module
-
-        monkeypatch.setattr(llm_module, "get_llm_for_reasoning", lambda: _Recording())
+        monkeypatch.setattr("core.llm.factory.get_llm", lambda _role: _Recording())
 
         console, _ = _capture()
         answer_shell_question("hi", Session(), console)

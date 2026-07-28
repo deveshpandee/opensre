@@ -17,8 +17,9 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field
 
-from config.version import get_version
-from core.llm.llm_client import get_llm_for_reasoning
+from config.constants.paths import REPO_ROOT
+from config.version import get_opensre_version
+from core.llm.factory import LLMRole, get_llm
 from integrations._validation_helpers import report_validation_failure
 
 logger = logging.getLogger(__name__)
@@ -523,7 +524,9 @@ def summarize_highlights(
 
     prompt = _build_summary_prompt(repository, window, pull_requests)
     try:
-        response = get_llm_for_reasoning().with_structured_output(HighlightResponse).invoke(prompt)
+        response = (
+            get_llm(LLMRole.REASONING).with_structured_output(HighlightResponse).invoke(prompt)
+        )
         highlights = tuple(item.strip() for item in response.highlights if item.strip())
         if highlights:
             return highlights, False
@@ -607,7 +610,7 @@ def render_markdown(update: DailyUpdate) -> str:
             "",
             "## Generation metadata",
             "",
-            f"- Generator version: `opensre {get_version()}`",
+            f"- Generator version: `opensre {get_opensre_version()}`",
             f"- Fallback summary used: `{'yes' if update.fallback_used else 'no'}`",
             f"- UTC window: `{update.window.start_utc.isoformat()}` to `{update.window.end_utc.isoformat()}`",
             "",
@@ -616,117 +619,15 @@ def render_markdown(update: DailyUpdate) -> str:
     return "\n".join(lines)
 
 
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
-
-
-def _docs_json_path() -> Path:
-    return _repo_root() / "docs" / "docs.json"
-
-
 def _output_dir() -> Path:
     configured = Path(_string(os.getenv("DAILY_UPDATE_OUTPUT_DIR")) or DEFAULT_OUTPUT_DIR)
     if configured.is_absolute():
         return configured
-    return _repo_root() / configured
+    return REPO_ROOT / configured
 
 
-def update_docs_navigation(_output_dir: Path) -> Path:
-    """Add only overview page to the Mintlify docs.json navigation."""
-    docs_json = _docs_json_path()
-    if not docs_json.exists():
-        return docs_json
-
-    config = json.loads(docs_json.read_text(encoding="utf-8"))
-
-    pages: list[str] = ["daily-updates/overview"]
-
-    for group in config.get("navigation", {}).get("groups", []):
-        if group.get("group") == "Daily Updates":
-            group["pages"] = pages
-            break
-
-    docs_json.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
-    return docs_json
-
-
-def _extract_highlights_from_archive(archive_path: Path, *, limit: int = 1) -> str:
-    """Extract first highlight(s) from an archive file for the overview."""
-    if not archive_path.exists():
-        return "No updates"
-    content = archive_path.read_text(encoding="utf-8")
-    lines = content.split("\n")
-    in_main_updates = False
-    highlights: list[str] = []
-    for line in lines:
-        if line.startswith("## Main updates shipped"):
-            in_main_updates = True
-            continue
-        if in_main_updates and line.startswith("## "):
-            break
-        if in_main_updates and line.startswith("- "):
-            highlight = line[2:].strip()
-            if highlight and not highlight.startswith("No pull requests"):
-                highlights.append(highlight)
-                if len(highlights) >= limit:
-                    break
-    if not highlights:
-        return "No updates"
-    return highlights[0].rsplit("\u2014", 1)[0].strip()
-
-
-def regenerate_overview(output_dir: Path) -> Path:
-    """Rebuild the overview page listing all daily updates in reverse chronological order."""
-    overview_path = output_dir / "overview.mdx"
-    archive_files = sorted(
-        (p for p in output_dir.glob("*.mdx") if p.name != "overview.mdx"),
-        key=lambda p: p.stem,
-        reverse=True,
-    )
-
-    latest = archive_files[:6]
-    archive = archive_files[6:]
-
-    lines = [
-        "---",
-        'title: "Daily Updates"',
-        'description: "OpenSRE engineering daily updates from merged pull requests"',
-        "---",
-        "",
-        "Daily updates are generated each evening (Europe/London) from the pull requests merged that day.",
-        "",
-        "## Latest Updates",
-        "",
-        "| Date | Highlights |",
-        "| ---- | ----------- |",
-    ]
-    for archive_file in latest:
-        slug = f"daily-updates/{archive_file.stem}"
-        highlight = _extract_highlights_from_archive(archive_file, limit=1)
-        if len(highlight) > 60:
-            highlight = highlight[:57].rsplit(" ", 1)[0] + "..."
-        lines.append(f"| {archive_file.stem} | [View](/{slug}) \u2014 {highlight} |")
-
-    if archive:
-        lines.extend(
-            [
-                "",
-                "## Archive",
-                "",
-                "| Date | Link |",
-                "| ---- | ---- |",
-            ]
-        )
-        for archive_file in archive:
-            slug = f"daily-updates/{archive_file.stem}"
-            lines.append(f"| {archive_file.stem} | [View](/{slug}) |")
-
-    if not archive_files:
-        lines.append("| \u2014 | No daily updates yet. |")
-
-    lines.append("")
-    overview_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return overview_path
+def _docs_json_path() -> Path:
+    return REPO_ROOT / "docs" / "docs.json"
 
 
 def write_daily_archive(update: DailyUpdate, *, output_dir: Path | None = None) -> Path:
@@ -735,10 +636,6 @@ def write_daily_archive(update: DailyUpdate, *, output_dir: Path | None = None) 
     target_dir.mkdir(parents=True, exist_ok=True)
     archive_path = target_dir / f"{update.window.london_date.isoformat()}.mdx"
     archive_path.write_text(render_markdown(update), encoding="utf-8")
-    # Changelog disabled — to re-enable: restore the Changelog tab in docs/docs.json,
-    # uncomment the Daily updates Card in docs/index.mdx, and uncomment both calls below.
-    # regenerate_overview(target_dir)
-    # update_docs_navigation(target_dir)
     return archive_path
 
 
@@ -766,11 +663,11 @@ def main() -> int:
     update = build_daily_update(repository, window, pull_requests)
     archive_path = write_daily_archive(update)
 
-    relative_archive_path = archive_path.relative_to(_repo_root()).as_posix()
+    relative_archive_path = archive_path.relative_to(REPO_ROOT).as_posix()
     overview_path = archive_path.parent / "overview.mdx"
-    relative_overview_path = overview_path.relative_to(_repo_root()).as_posix()
+    relative_overview_path = overview_path.relative_to(REPO_ROOT).as_posix()
     docs_json = _docs_json_path()
-    relative_docs_json = docs_json.relative_to(_repo_root()).as_posix()
+    relative_docs_json = docs_json.relative_to(REPO_ROOT).as_posix()
     _append_github_output("archive_path", relative_archive_path)
     _append_github_output("overview_path", relative_overview_path)
     _append_github_output("docs_json_path", relative_docs_json)

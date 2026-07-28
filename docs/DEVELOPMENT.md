@@ -24,7 +24,7 @@ From the repo root:
 ```bash
 make lint          # ruff check
 make format-check  # ruff format --check (CI-enforced)
-make typecheck     # mypy app/
+make typecheck     # mypy config core gateway integrations platform surfaces tools
 make test-cov      # pytest + coverage (default unit suite)
 ```
 
@@ -36,13 +36,30 @@ Before a PR, run at least `make lint`, `make format-check`, `make typecheck`, an
 
 Action-planner behavior, postprocessing transforms, compatibility seams, and the rule-extension checklist are documented in [`docs/interactive-shell-action-policy.md`](https://github.com/Tracer-Cloud/opensre/blob/main/docs/interactive-shell-action-policy.md).
 
+## Package architecture
+
+The seven first-party packages, the four-tier layering (which package may
+import which), the folder diagram, per-layer responsibilities, and cross-layer
+flows are documented in [`docs/ARCHITECTURE.md`](ARCHITECTURE.md).
+
+## Tool registry — surface-scoped, lazy loading
+
+Loading every vendor tool at startup was slow. A static index
+(`tools/registry_index.py`) reads tool metadata by scanning the source, without importing executors, so a turn loads only the tools it needs.
+
+- `get_registered_tools(surface)` imports only that surface's tool modules.
+- `get_tool_descriptors(surface)` returns metadata with no executor import.
+- `load_tool(descriptor)` imports the executor, only when a tool runs.
+
+Adding a vendor tool is a `@tool`/`BaseTool` module; the index finds it and no other vendor is imported. `tests/tools/test_registry_index.py` checks the index matches the imported registry exactly, so they cannot drift.
+
 ## Investigation pipeline architecture
 
 The six-stage investigation pipeline (resolve integrations → extract alert → plan → ReAct evidence loop → diagnose → deliver), the loop's guardrails (tool cap, stagnation breaker, context budget, duplicate detection), and diagrams are documented in [`docs/investigation-pipeline-architecture.md`](investigation-pipeline-architecture.md).
 
 ## Investigation tool calling
 
-Tool schemas, provider adapters (`agent_llm_client.py`), and investigation message shapes are documented in [`docs/investigation-tool-calling.md`](investigation-tool-calling.md) (all LLM providers, not vendor-specific).
+Tool schemas, provider adapters (`transports/sdk/agent_clients.py`), and investigation message shapes are documented in [`docs/investigation-tool-calling.md`](investigation-tool-calling.md) (all LLM providers, not vendor-specific).
 
 ## Interactive shell: REPL watchdog demo
 
@@ -53,7 +70,7 @@ PR reviewers expect a **visible demo** (terminal log or screenshot) in the PR un
 3. `/watch <pid> --max-cpu 80` — expect `task … started.` (use a real PID, e.g. the shell’s Python process).
 4. `/watches` — table columns include id, pid, kind, status, thresholds, last sample.
 5. `/unwatch <task_id>` or `/cancel <task_id>` — then `/watches` again; status should show **cancelled**.
-6. Optional: lower `--max-cpu` so a threshold trips; after Telegram sends, the REPL prints one line: `[task …] alarm fired: … (telegram delivered)`.
+6. Optional: lower `--max-cpu` so a threshold trips; after delivery, the REPL prints one line: `[task …] alarm fired: … (telegram delivered)`. Add `--provider rocketchat --chat-id "#channel"` to `/watch` to alarm via Rocket.Chat instead (`… (rocketchat delivered)`).
 
 Automated equivalent (runs in `make test-cov`):  
 `uv run pytest tests/interactive_shell/test_watchdog_repl_e2e_demo.py -v --tb=short`
@@ -74,11 +91,23 @@ To refresh README benchmark copy from cached results (no LLM calls): `make bench
 
 ## Deployment
 
-### Hosted runtime
+Full deployment instructions, prerequisites, and environment variable reference:
+**[DEPLOYMENT.md](../DEPLOYMENT.md)**
+
+Quick reference:
+
+| Path | Commands |
+| ---- | -------- |
+| EC2 (Docker/ECR — web + gateway) | `make build-image` → `make deploy` / `make destroy` |
+| Gateway (AMI + systemd — gateway only) | `make bake-gateway` → `make deploy-gateway` / `make destroy-gateway` |
+| Hosted (Railway / ECS / Vercel) | Deploy with repo `Dockerfile`; set `LLM_PROVIDER` + API key |
+
+### Hosted runtime (Railway / ECS / Vercel)
 
 1. Deploy this repository as a standard Python/FastAPI app using the repo `Dockerfile` or your host's native Python workflow.
 2. Set `LLM_PROVIDER` and the matching API key (for example `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` — see [`.env.example`](https://github.com/Tracer-Cloud/opensre/blob/main/.env.example)).
-3. Add integration and storage env vars your deployment needs.
+3. Add `DATABASE_URI` and `REDIS_URI` for hosted layouts that need persistence.
+4. Add integration and storage env vars your deployment needs.
 
 Minimal LLM env:
 
@@ -87,37 +116,9 @@ export LLM_PROVIDER=anthropic
 export ANTHROPIC_API_KEY=...
 ```
 
-### Railway (self-hosted alternative)
-
-Ensure the Railway project has Postgres and Redis and that the OpenSRE service has **`DATABASE_URI`** and **`REDIS_URI`** wired to them before deploying.
-
-Deploy the service using your Railway project workflow (see [deployment.mdx](deployment.mdx)).
-
-After deploy, register the remote agent:
-
-```bash
-opensre remote --url https://<your-service>.up.railway.app health
-```
-
-If the service never becomes healthy, confirm both `DATABASE_URI` and `REDIS_URI` are set on the service.
-
-### Remote hosted ops (Railway)
-
-After deploy:
-
-```bash
-opensre remote ops --provider railway --project <project> --service <service> status
-opensre remote ops --provider railway --project <project> --service <service> logs --lines 200
-opensre remote ops --provider railway --project <project> --service <service> logs --follow
-opensre remote ops --provider railway --project <project> --service <service> restart --yes
-```
-
-OpenSRE remembers the last `provider`, so you can shorten to:
-
-```bash
-opensre remote ops status
-opensre remote ops logs --follow
-```
+For Railway: ensure the project has Postgres and Redis services and that the OpenSRE
+service has `DATABASE_URI` and `REDIS_URI` set before deploying. Set
+`OPENSRE_DEPLOYMENT_METHOD=railway` for telemetry labeling.
 
 ## Telemetry and privacy
 
@@ -128,13 +129,27 @@ opensre remote ops logs --follow
 
 Events are tagged with `entrypoint`, `opensre.runtime`, and `deployment_method`. Sensitive headers, paths, and secret-shaped keys are scrubbed before send.
 
+PostHog product events also carry `execution_environment` (`local`, `ci`, `container`,
+or `ci_container`), `is_ci`, `is_container`, and `container_runtime`. Use these
+first-party fields to exclude automated environments from product funnels; PostHog's
+virtual traffic classification intentionally treats CLI HTTP clients as automation.
+
 A random install ID is stored under `~/.opensre/anonymous_id`. PostHog `distinct_id` is scoped to that ID. Telemetry is off in GitHub Actions and pytest.
 
 ### First-launch GitHub login
 
-On the first interactive launch (all platforms, except CI/CD and test harnesses), OpenSRE requires a GitHub device-flow sign-in before the REPL prompt. On success it sets `github_username` as a PostHog **person property** (via `$identify`/`$set`, which forces `$process_person_profile: True` for that one event — this is the only intentional PII OpenSRE sends) and emits a `github_login_completed` event. A configured GitHub integration suppresses re-prompting on later launches.
+On the first interactive launch (all platforms, except CI/CD and test harnesses), OpenSRE runs a GitHub device-flow sign-in gate before the REPL prompt. Installs are split offline into an A/B experiment via sticky bucketing on `~/.opensre/anonymous_id`:
 
-The existing kill-switches still apply: `OPENSRE_NO_TELEMETRY` / `DO_NOT_TRACK` make the `$identify` and `github_login_completed` calls no-ops, but the login itself still runs. Set `OPENSRE_SKIP_GITHUB_LOGIN=1` to bypass the login gate entirely (also auto-bypassed in CI — `CI=true`, `GITHUB_ACTIONS=true` — and in pytest).
+| Variant | Behavior | How to force locally |
+| --- | --- | --- |
+| `control` | Skip allowed (menu + Escape defer the gate) | `OPENSRE_GITHUB_GATE_VARIANT=control` |
+| `forced` | Skip removed; abandoning the gate aborts startup | `OPENSRE_GITHUB_GATE_VARIANT=forced` |
+
+Every gate exposure emits `github_login_prompted` with `github_gate_variant`. Outcomes are `github_login_completed`, `github_login_skipped` (control only), or `github_login_abandoned` (forced drop-off). The variant is also stamped as a persistent event property so later REPL events break down by cohort. On success OpenSRE sets `github_username` as a PostHog **person property** (via `$identify`/`$set`, which forces `$process_person_profile: True` for that one event — this is the only intentional PII OpenSRE sends). A configured GitHub integration suppresses re-prompting on later launches.
+
+Because bucketing is local and does not call PostHog feature flags, PostHog's built-in experiment exposure chart will not populate automatically. Configure `github_login_prompted` as the custom exposure event and use `github_gate_variant` as the breakdown/filter for funnels and trends.
+
+The existing kill-switches still apply: `OPENSRE_NO_TELEMETRY` / `DO_NOT_TRACK` make analytics calls no-ops, but the login itself still runs. Set `OPENSRE_SKIP_GITHUB_LOGIN=1` to bypass the login gate entirely (also auto-bypassed in CI — `CI=true`, `GITHUB_ACTIONS=true` — and in pytest).
 
 ### Kill-switch matrix
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Any
 
 from core.tool_framework.tool_decorator import tool
+from core.tool_framework.utils.tool_availability import tool_unavailable
 from integrations.tempo import TempoConfig, tempo_extract_params
 from integrations.tempo.availability import tempo_available_or_backend
 from integrations.tempo.client import TempoClient
@@ -67,7 +68,6 @@ def _dispatch(
     display_name="Grafana Tempo",
     source="tempo",
     tags=("traces", "observability"),
-    cost_tier="moderate",
     description=(
         "Query a standalone Grafana Tempo backend for distributed traces. "
         "Use 'action' to pick: search traces, fetch a trace by ID, or list "
@@ -142,12 +142,7 @@ def query_tempo(
 
     config = TempoConfig.model_validate(_kwargs)
     if not config.is_configured:
-        return {
-            "source": "tempo",
-            "action": action,
-            "available": False,
-            "error": "Tempo not configured. Provide TEMPO_URL.",
-        }
+        return tool_unavailable("tempo", "Tempo not configured. Provide TEMPO_URL.", action=action)
 
     return _dispatch(
         TempoClient(config),

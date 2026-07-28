@@ -11,6 +11,7 @@ import difflib
 import json
 import logging
 import re
+from http import HTTPStatus
 from typing import Any
 from urllib.parse import quote
 
@@ -18,7 +19,7 @@ import httpx
 
 from integrations.config_models import ArgoCDIntegrationConfig
 from integrations.probes import ProbeResult
-from platform.observability.service_errors import capture_service_error
+from platform.observability.errors.service import capture_service_error
 
 logger = logging.getLogger(__name__)
 
@@ -184,7 +185,7 @@ class ArgoCDClient:
                 return response
             except httpx.HTTPStatusError as exc:
                 if (
-                    exc.response.status_code == 401
+                    exc.response.status_code == HTTPStatus.UNAUTHORIZED
                     and self._session_token
                     and not self.config.bearer_token
                 ):

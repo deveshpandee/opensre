@@ -1,7 +1,7 @@
 """Shell adapter for one conversational answer turn.
 
 Binds the interactive shell's Rich output, grounding caches, reasoning client,
-and telemetry around core ``answer_cli_agent``.
+and telemetry around core ``stream_answer``.
 """
 
 from __future__ import annotations
@@ -10,19 +10,17 @@ from collections.abc import Callable
 
 from rich.console import Console
 
-from core.agent_harness.agents.turn_orchestrator import (
-    answer_cli_agent as run_core_answer_cli_agent,
-)
-from core.agent_harness.models.turn_context import TurnContext
+from core.agent_harness.accounting.run_record import DefaultRunRecordFactory
+from core.agent_harness.error_reporting import DefaultErrorReporter
 from core.agent_harness.ports import OutputSink
-from core.agent_harness.providers.default_prompt_context import DefaultPromptContextProvider
-from core.agent_harness.providers.default_providers import (
-    DefaultErrorReporter,
-    DefaultReasoningClientProvider,
-    DefaultRunRecordFactory,
+from core.agent_harness.turns.default_reasoning_client import DefaultReasoningClientProvider
+from core.agent_harness.turns.orchestrator import (
+    stream_answer as core_stream_answer,
 )
-from core.agent_harness.session import Session
+from core.agent_harness.turns.turn_plan import TurnPlan
+from surfaces.interactive_shell.grounding.cli_reference import shell_prompt_context_provider
 from surfaces.interactive_shell.runtime.agent_harness_adapters import resolve_output_sink
+from surfaces.interactive_shell.session import Session
 from surfaces.interactive_shell.utils.telemetry import LlmRunInfo
 
 
@@ -35,16 +33,17 @@ def answer_shell_question(
     is_tty: bool | None = None,
     tool_observation: str | None = None,
     tool_observation_on_screen: bool = True,
-    turn_ctx: TurnContext | None = None,
+    handoff_contents: tuple[str, ...] = (),
+    turn_plan: TurnPlan | None = None,
     output: OutputSink | None = None,
 ) -> LlmRunInfo | None:
     """Answer one shell question through the grounded conversational assistant."""
     resolved_output = resolve_output_sink(console, output)
-    return run_core_answer_cli_agent(
+    return core_stream_answer(
         message,
         session,
         resolved_output,
-        prompts=DefaultPromptContextProvider(session),
+        prompts=shell_prompt_context_provider(session),
         reasoning=DefaultReasoningClientProvider(
             output=resolved_output,
             error_reporter=DefaultErrorReporter(),
@@ -56,7 +55,8 @@ def answer_shell_question(
         is_tty=is_tty,
         tool_observation=tool_observation,
         tool_observation_on_screen=tool_observation_on_screen,
-        turn_ctx=turn_ctx,
+        handoff_contents=handoff_contents,
+        turn_plan=turn_plan,
     )
 
 

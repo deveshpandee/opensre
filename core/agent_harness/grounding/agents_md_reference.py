@@ -1,7 +1,8 @@
 """AGENTS.md grounding helpers for OpenSRE interactive-shell answers.
 
 The conversational interactive-shell assistant grounds answers on the
-``opensre --help`` reference (via :class:`~core.agent_harness.grounding.cli_reference.CliReference`)
+``opensre --help`` reference (via
+:class:`~surfaces.interactive_shell.grounding.cli_reference.ShellPromptContextProvider`)
 and, for procedural questions, excerpts from ``docs/`` (via
 :class:`~core.agent_harness.grounding.docs_reference.DocsReference`). Neither surface
 includes internal repo-map content, so the assistant cannot answer questions
@@ -45,13 +46,10 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
+from config.constants.paths import REPO_ROOT
 from core.agent_harness.grounding._cache import excerpt
 from core.agent_harness.grounding.diagnostics import GroundingSource
 from core.agent_harness.grounding.models import CacheStats
-
-# Repo root is three levels above this file
-# (.../core/agent_harness/grounding/agents_md_reference.py -> repo root).
-_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 _AGENTS_MD_FILENAME = "AGENTS.md"
 
@@ -183,7 +181,7 @@ class AgentsMdReference:
 
     def discover(self, root: Path | None = None) -> list[AgentsMdFile]:
         """Walk the repo root, parse each ``AGENTS.md``, return :class:`AgentsMdFile` records."""
-        target = root if root is not None else _REPO_ROOT
+        target = root if root is not None else REPO_ROOT
         resolved = target.resolve() if target.exists() else target
         root_key = str(resolved)
 

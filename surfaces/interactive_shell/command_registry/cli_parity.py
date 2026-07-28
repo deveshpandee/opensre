@@ -13,6 +13,10 @@ from pathlib import Path
 from rich.console import Console
 from rich.markup import escape
 
+from core.agent_harness.session.terminal_access import (
+    session_terminal,
+    set_turn_outcome_hint,
+)
 from surfaces.interactive_shell.command_registry.suggestions import closest_choice
 from surfaces.interactive_shell.command_registry.types import SlashCommand
 from surfaces.interactive_shell.runtime import Session, TaskKind
@@ -22,6 +26,7 @@ from surfaces.interactive_shell.runtime.subprocess_runner import (
     start_background_cli_task,
 )
 from surfaces.interactive_shell.ui import DIM, ERROR, print_command_output
+from surfaces.interactive_shell.ui.components.choice_menu import prepare_repl_output_line
 from surfaces.interactive_shell.utils.telemetry.turn_outcome import format_wizard_cli_outcome
 
 _UPDATE_SUBPROCESS_TIMEOUT_SECONDS = 300
@@ -29,6 +34,22 @@ _BACKGROUND_TEST_SUBCOMMANDS = frozenset({"run", "synthetic", "cloudopsbench"})
 _TEST_SUBCOMMANDS = ("list", "run", "synthetic", "cloudopsbench")
 _TEST_PICKER_SELECTION_FILE_ENV = "OPENSRE_TEST_PICKER_SELECTION_FILE"
 _PARENT_INTERACTIVE_SHELL_ENV = "OPENSRE_PARENT_INTERACTIVE_SHELL"
+_HEADLESS_CLI_SUBPROCESS_TIMEOUT_SECONDS = 90.0
+
+
+def publish_headless_slash_response(
+    session: Session,
+    *,
+    message: str,
+    ok: bool = True,
+) -> None:
+    """Pin an explicit slash reply for gateway/headless surfaces (wizards, setup)."""
+    session.complete_latest_record(
+        "slash",
+        response_text=message.strip(),
+        ok=ok,
+        slash_outcome="headless_guidance",
+    )
 
 
 def _decode_subprocess_stream(value: str | bytes | None) -> str:
@@ -37,6 +58,10 @@ def _decode_subprocess_stream(value: str | bytes | None) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return value
+
+
+def _cli_command_succeeded(exit_code: int | None) -> bool:
+    return exit_code == 0
 
 
 def run_cli_command(
@@ -52,15 +77,25 @@ def run_cli_command(
     ``subprocess_timeout`` caps how long ``subprocess.run`` waits before raising
     :class:`~subprocess.TimeoutExpired`. Interactive flows use ``None`` so the
     child can prompt as long as needed; callers that hit the network without a
-    TTY (like ``opensre update``) pass a bounded timeout.
+    guaranteed response (like ``opensre update``) pass a bounded timeout. The
+    timeout applies whether or not output is captured — it no longer forces
+    capture, so a long-running network command can still stream live to the
+    real TTY (e.g. the install script's own progress output during an update)
+    while still being killed if it hangs.
 
     ``capture_output`` (default ``False``) makes the helper capture stdout/stderr
-    and replay them through ``console`` even without a timeout. Set this for
-    non-interactive delegated commands (e.g. ``opensre tests list``) so their
-    output appears inside the REPL buffer instead of bypassing ``console.print``
-    via the child's inherited stdout FD. Interactive commands like ``onboard``
-    must leave this ``False`` so the child's prompts stay attached to the real
-    TTY. Capture is also enabled automatically whenever a timeout is set.
+    and replay them through ``console``. Set this for non-interactive delegated
+    commands (e.g. ``opensre tests list``) so their output appears inside the
+    REPL buffer instead of bypassing ``console.print`` via the child's inherited
+    stdout FD. Interactive commands, and commands whose child prints its own
+    terminal-aware progress UI (``onboard``, ``update``), must leave this
+    ``False`` so the child's output stays attached to the real TTY.
+
+    **Return value:** Reports subprocess success for headless/gateway sessions
+    (``session`` with no terminal facet) so slash analytics can show failure.
+    On the interactive REPL, always returns ``True`` so delegated CLI failures
+    do not propagate to :func:`dispatch_slash` and exit the shell — failures
+    are still recorded via :meth:`Session.mark_latest`.
 
     Ctrl+C sends :exc:`KeyboardInterrupt`, which subclasses :exc:`BaseException`
     rather than :exc:`Exception`; it is handled here so the REPL survives and the
@@ -68,9 +103,16 @@ def run_cli_command(
     """
     console.print()
     cmd = build_opensre_cli_argv(args)
-    should_capture = capture_output or subprocess_timeout is not None
+    headless = session is not None and session_terminal(session) is None
+    should_capture = capture_output or headless
+    if headless and subprocess_timeout is None:
+        subprocess_timeout = _HEADLESS_CLI_SUBPROCESS_TIMEOUT_SECONDS
     child_env = os.environ.copy()
     child_env[_PARENT_INTERACTIVE_SHELL_ENV] = "1"
+    if should_capture:
+        # Captured child stdout isn't a TTY, so force Rich colour there and parse
+        # it back in print_command_output — otherwise its styling would be lost.
+        child_env["FORCE_COLOR"] = "1"
     exit_code: int | None = 0
     try:
         if should_capture:
@@ -92,30 +134,67 @@ def run_cli_command(
                     f"[{ERROR}]CLI command exited with non-zero code {captured_result.returncode}[/]"
                 )
         else:
-            interactive_result = subprocess.run(cmd, check=False, env=child_env)
+            # timeout=None is a no-op for subprocess.run, so this covers both the
+            # timed (/update) and untimed (/onboard) interactive callers.
+            interactive_result = subprocess.run(
+                cmd, check=False, timeout=subprocess_timeout, env=child_env
+            )
             exit_code = interactive_result.returncode
+            # The child wrote straight to the terminal, bypassing Rich, so Rich has no
+            # idea where the cursor ended up (e.g. mid-line after a \r-redrawn progress
+            # bar). Force a fresh line before resuming Rich output, or the blank line
+            # below just terminates the child's last line instead of being a real gap.
+            prepare_repl_output_line()
+            console.print()
             if interactive_result.returncode != 0:
                 console.print(
                     f"[{ERROR}]CLI command exited with non-zero code {interactive_result.returncode}[/]"
                 )
     except subprocess.TimeoutExpired as exc:
         exit_code = None
+        # Same cursor hazard as the normal-exit and KeyboardInterrupt paths, and the
+        # most likely one to actually hit it: the timeout exists specifically to
+        # kill a hung install script, i.e. a streamed child mid-redraw of its own
+        # progress bar.
+        prepare_repl_output_line()
         print_command_output(console, _decode_subprocess_stream(exc.stdout))
         print_command_output(console, _decode_subprocess_stream(exc.stderr), style=ERROR)
         console.print(f"[{ERROR}]error:[/] CLI command timed out")
     except KeyboardInterrupt:
         exit_code = None
+        # Same cursor hazard as the normal-exit path: Ctrl+C can land mid-line while
+        # a streamed child is mid-redraw of its own progress bar.
+        prepare_repl_output_line()
         console.print(f"[{DIM}]CLI command cancelled (Ctrl+C).[/]")
     except Exception as exc:
         exit_code = None
         console.print(f"[{ERROR}]error running CLI command:[/] {exc}")
     console.print()
     if session is not None and not should_capture:
-        session.set_turn_outcome_hint(format_wizard_cli_outcome(args, exit_code=exit_code))
-    return True
+        set_turn_outcome_hint(session, format_wizard_cli_outcome(args, exit_code=exit_code))
+    ok = _cli_command_succeeded(exit_code)
+    if session is not None and not ok:
+        session.mark_latest(ok=False, kind="slash")
+    # Headless/gateway surfaces need the real exit status for slash analytics.
+    # Interactive REPL handlers must not return False to dispatch_slash on CLI
+    # failure — that would exit the shell (/exit is the only intentional False).
+    return ok if headless else True
 
 
 def _cmd_onboard(session: Session, console: Console, args: list[str]) -> bool:  # noqa: ARG001
+    if session_terminal(session) is None:
+        cli_cmd = " ".join(["uv run opensre onboard", *args]).strip()
+        message = (
+            "Onboarding is an interactive wizard (LLM provider, integrations, messaging). "
+            "It cannot run inside a Telegram chat.\n\n"
+            f"Run on the server:\n  {cli_cmd}\n\n"
+            "Or configure individual services with "
+            "`/integrations setup <service>`."
+        )
+        console.print()
+        console.print(message)
+        publish_headless_slash_response(session, message=message)
+        return True
     # The REPL loop treats ``/onboard`` as exclusive-stdin in
     # ``runtime.utils.input_policy`` so the prompt_toolkit Application is torn down before
     # this handler runs — the wizard subprocess therefore gets exclusive
@@ -134,7 +213,7 @@ def _cmd_login(session: Session, console: Console, args: list[str]) -> bool:  # 
 
 
 def _cmd_remote(session: Session, console: Console, args: list[str]) -> bool:  # noqa: ARG001
-    return run_cli_command(console, ["remote", *args])
+    return run_cli_command(console, ["remote", *args], session=session)
 
 
 def _catalog_task_kind(command: list[str]) -> TaskKind:
@@ -267,6 +346,7 @@ def _cmd_update(session: Session, console: Console, args: list[str]) -> bool:  #
         console,
         ["update", *args],
         subprocess_timeout=_UPDATE_SUBPROCESS_TIMEOUT_SECONDS,
+        session=session,
     )
 
 
@@ -280,8 +360,10 @@ def _cmd_config(session: Session, console: Console, args: list[str]) -> bool:  #
     return run_cli_command(console, ["config", *args], capture_output=True)
 
 
-def _cmd_messaging(session: Session, console: Console, args: list[str]) -> bool:  # noqa: ARG001
-    return run_cli_command(console, ["messaging", *args])
+def _cmd_messaging(session: Session, console: Console, args: list[str]) -> bool:
+    # Non-interactive subcommands: capture so output renders through the REPL
+    # (inherited stdout gets clipped by prompt_toolkit's screen management).
+    return run_cli_command(console, ["messaging", *args], capture_output=True, session=session)
 
 
 def _cmd_hermes(session: Session, console: Console, args: list[str]) -> bool:  # noqa: ARG001
@@ -290,6 +372,10 @@ def _cmd_hermes(session: Session, console: Console, args: list[str]) -> bool:  #
 
 def _cmd_cron(session: Session, console: Console, args: list[str]) -> bool:  # noqa: ARG001
     return run_cli_command(console, ["cron", *args])
+
+
+def _cmd_sentry(session: Session, console: Console, args: list[str]) -> bool:  # noqa: ARG001
+    return run_cli_command(console, ["sentry", *args], capture_output=True)
 
 
 def _cmd_watchdog(session: Session, console: Console, args: list[str]) -> bool:  # noqa: ARG001
@@ -393,6 +479,23 @@ COMMANDS: list[SlashCommand] = [
         "Manage cron-driven scheduled deliveries.",
         _cmd_cron,
         usage=("/cron list", "/cron add", "/cron remove <id>", "/cron run <id>", "/cron logs <id>"),
+    ),
+    SlashCommand(
+        "/sentry",
+        "Schedule and run automated Sentry morning digests or uptime watches.",
+        _cmd_sentry,
+        usage=(
+            "/sentry digest run",
+            "/sentry digest schedule list",
+            "/sentry digest schedule add",
+            "/sentry digest schedule run <id>",
+            "/sentry digest schedule remove <id>",
+            "/sentry uptime check",
+            "/sentry uptime watch list",
+            "/sentry uptime watch add",
+            "/sentry uptime watch run <id>",
+            "/sentry uptime watch remove <id>",
+        ),
     ),
     SlashCommand(
         "/watchdog",

@@ -3,7 +3,7 @@
 These are the seams that keep ``agent/`` decoupled from any concrete surface.
 The interactive shell implements them as adapters over its ``Session``,
 Rich console, tool registry, and grounding caches; the headless adapters in
-:mod:`core.agent_harness.agents.headless_agent` implement minimal in-memory versions for API / test runs.
+:mod:`core.agent_harness.turns.headless_dispatch` implement minimal in-memory versions for API / test runs.
 
 Nothing here imports ``interactive_shell``.
 """
@@ -13,7 +13,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Sequence
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from core.agent_harness.models.turn_results import ShellTurnResult, ToolCallingTurnResult
+from core.agent_harness.turns.turn_results import ShellTurnResult, ToolCallingTurnResult
 
 if TYPE_CHECKING:
     pass
@@ -56,7 +56,7 @@ class SessionStore(Protocol):
     action driver, the three-path engine, and the gather loop touch.
     """
 
-    # --- turn-context snapshot fields (see core.agent_harness.models.turn_context.TurnContextSource) ---
+    # --- turn-context snapshot fields (see core.agent_harness.turns.turn_snapshot.TurnSnapshotSource) ---
     cli_agent_messages: list[tuple[str, str]]
     configured_integrations_known: bool
 
@@ -77,7 +77,7 @@ class SessionStore(Protocol):
 
     # --- gather caches ---
     resolved_integrations_cache: dict[str, Any] | None
-    github_repo_scope: tuple[str, str] | None
+    vcs_repo_scopes: dict[str, tuple[str, ...]]
 
     def record(self, kind: str, text: str, *, ok: bool = True) -> None:
         """Append a record of an executed action/turn to the session log."""
@@ -87,14 +87,36 @@ class SessionStore(Protocol):
 class ToolProvider(Protocol):
     """Supplies the action-agent tools and the per-turn tool-event observer."""
 
-    def action_tools(self, *, confirm_fn: ConfirmFn | None, is_tty: bool | None) -> list[Any]:
-        """Return the agent tools available for this turn."""
+    def action_tools(
+        self,
+        *,
+        confirm_fn: ConfirmFn | None,
+        is_tty: bool | None,
+        resolved_integrations: dict[str, Any] | None = None,
+    ) -> list[Any]:
+        """Return the agent tools available for this turn.
+
+        When ``resolved_integrations`` is supplied it is the turn's single
+        resolved-integration view (from ``TurnSnapshot``); the provider builds
+        tools from it instead of resolving again, so tools and the prompt agree.
+        """
 
     def tool_resources(self) -> dict[str, Any]:
         """Return non-serializable resources for tools that opt into runtime context."""
 
     def observer(self, *, message: str) -> ToolEventObserver:
         """Return a tool-event observer for this turn (e.g. terminal renderer)."""
+
+
+@runtime_checkable
+class ToolRegistry(Protocol):
+    """Resolves the registered tools available to a named surface."""
+
+    def tools_for_surface(self, surface: str) -> list[Any]:
+        """Return the registered tools for ``surface`` (e.g. ``"action"``)."""
+
+    def tool_map_for_surface(self, surface: str) -> dict[str, Any]:
+        """Return the registered tools for ``surface`` keyed by tool name."""
 
 
 @runtime_checkable
@@ -114,16 +136,26 @@ class PromptContextProvider(Protocol):
     caches, the headless adapter returns empty strings.
     """
 
+    def surface(self) -> str:
+        """Which surface this turn runs on; defaults to the interactive shell."""
+        return "interactive_shell"
+
     def cli_reference(self) -> str:
         raise NotImplementedError
 
     def agents_md(self) -> str:
         raise NotImplementedError
 
+    def docs(self, query: str) -> str:
+        raise NotImplementedError
+
     def investigation_flow(self) -> str:
         raise NotImplementedError
 
     def environment_block(self) -> str:
+        raise NotImplementedError
+
+    def long_term_memory(self) -> str:
         raise NotImplementedError
 
     def suggested_synthetic_prompt(self) -> str:
@@ -149,16 +181,16 @@ class RunRecordFactory(Protocol):
         raise NotImplementedError
 
 
-# Bound conversational-answer callable. Returns an opaque LLM-run record (or
-# None). The shell binds session/console/grounding; headless binds a simple
-# core-LLM call.
-AnswerAgent = Callable[..., Any]
+# Bound direct-answer callable (no tools):
+# ``answer(text, *, confirm_fn, is_tty, tool_observation, turn_plan) -> LLM-run record | None``.
+StreamAnswerFn = Callable[..., Any]
 
-# Bound evidence-gather callable: ``gather(text, *, is_tty) -> str | None``.
+# Bound evidence-gather callable:
+# ``gather(text, *, is_tty, turn_plan) -> str | None``.
 EvidenceGatherer = Callable[..., "str | None"]
 
 # Bound action tool-calling driver:
-# ``execute_actions(text, *, confirm_fn, is_tty, turn_ctx) -> ToolCallingTurnResult``.
+# ``execute_actions(text, *, confirm_fn, is_tty, turn_plan) -> ToolCallingTurnResult``.
 ExecuteActions = Callable[..., ToolCallingTurnResult]
 
 
@@ -174,7 +206,7 @@ class TurnAccounting(Protocol):
 
 
 __all__ = [
-    "AnswerAgent",
+    "StreamAnswerFn",
     "ConfirmFn",
     "ErrorReporter",
     "EvidenceGatherer",
@@ -186,5 +218,6 @@ __all__ = [
     "SessionStore",
     "ToolEventObserver",
     "ToolProvider",
+    "ToolRegistry",
     "TurnAccounting",
 ]

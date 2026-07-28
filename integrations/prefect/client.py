@@ -15,7 +15,7 @@ import httpx
 from pydantic import field_validator
 
 from config.strict_config import StrictConfigModel
-from platform.observability.service_errors import capture_service_error
+from platform.observability.errors.service import capture_service_error
 
 logger = logging.getLogger(__name__)
 
@@ -282,49 +282,6 @@ class PrefectClient:
                 integration="prefect",
                 method="get_workers",
                 extras={"work_pool_name": work_pool_name},
-            )
-            return {"success": False, "error": str(exc)}
-
-    # ------------------------------------------------------------------
-    # Deployments
-    # ------------------------------------------------------------------
-
-    def get_deployments(self, limit: int = 20) -> dict[str, Any]:
-        """List Prefect deployments.
-
-        Args:
-            limit: Maximum number of deployments to return.
-        """
-        body: dict[str, Any] = {"limit": min(limit, 200)}
-        try:
-            resp = self._get_client().post("/deployments/filter", json=body)
-            resp.raise_for_status()
-            raw: list[dict[str, Any]] = resp.json()
-            deployments = [
-                {
-                    "id": d.get("id", ""),
-                    "name": d.get("name", ""),
-                    "flow_id": d.get("flow_id", ""),
-                    "is_schedule_active": d.get("is_schedule_active", False),
-                    "work_pool_name": d.get("work_pool_name", ""),
-                    "last_polled": d.get("last_polled", ""),
-                    "status": d.get("status", ""),
-                    "tags": d.get("tags", []),
-                }
-                for d in raw
-            ]
-            return {"success": True, "deployments": deployments, "total": len(deployments)}
-        except httpx.HTTPStatusError as exc:
-            capture_service_error(
-                exc, logger=logger, integration="prefect", method="get_deployments"
-            )
-            return {
-                "success": False,
-                "error": f"HTTP {exc.response.status_code}: {exc.response.text[:200]}",
-            }
-        except Exception as exc:
-            capture_service_error(
-                exc, logger=logger, integration="prefect", method="get_deployments"
             )
             return {"success": False, "error": str(exc)}
 

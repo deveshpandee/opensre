@@ -187,19 +187,26 @@ class ReplConfig:
         if (env_val := os.getenv("OPENSRE_ALERT_LISTENER_PORT")) is not None:
             try:
                 alert_listener_port = int(env_val.strip())
-            except ValueError:
+                if not (0 <= alert_listener_port <= 65535):
+                    raise ValueError(f"Port out of range: {alert_listener_port}")
+            except (ValueError, TypeError):
                 log.warning(
                     "OPENSRE_ALERT_LISTENER_PORT=%r is not a valid port number; defaulting to 0 (random).",
                     env_val,
                 )
                 alert_listener_port = 0
         else:
+            raw_port = file_conf.get("alert_listener_port", 0)
             try:
-                alert_listener_port = int(file_conf.get("alert_listener_port", 0))
-            except ValueError:
+                if isinstance(raw_port, (bool, float)) or raw_port is None:
+                    raise TypeError(f"Invalid port type: {type(raw_port).__name__}")
+                alert_listener_port = int(raw_port)
+                if not (0 <= alert_listener_port <= 65535):
+                    raise ValueError(f"Port out of range: {alert_listener_port}")
+            except (ValueError, TypeError):
                 log.warning(
                     "config.yml interactive.alert_listener_port=%r is not a valid port number; defaulting to 0 (random).",
-                    file_conf.get("alert_listener_port"),
+                    raw_port,
                 )
                 alert_listener_port = 0
 
@@ -237,3 +244,33 @@ def read_prompt_log_settings() -> dict[str, Any]:
     interactive = _read_config_file()
     raw = interactive.get("prompt_log", {})
     return raw if isinstance(raw, dict) else {}
+
+
+def read_github_login_deferred() -> bool:
+    """Return True when the user skipped the first-launch GitHub sign-in prompt."""
+    interactive = _read_config_file()
+    return ReplConfig._coerce_bool(interactive.get("github_login_deferred"), default=False)
+
+
+def write_github_login_deferred(deferred: bool) -> None:
+    """Persist or clear the first-launch GitHub sign-in deferral flag."""
+    try:
+        import yaml  # type: ignore[import-untyped]
+
+        from config.constants import OPENSRE_HOME_DIR
+
+        config_path = OPENSRE_HOME_DIR / "config.yml"
+        data: dict[str, Any] = {}
+        if config_path.exists():
+            loaded = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        interactive = data.get("interactive")
+        if not isinstance(interactive, dict):
+            interactive = {}
+        interactive["github_login_deferred"] = deferred
+        data["interactive"] = interactive
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    except Exception:
+        log.debug("Could not persist github_login_deferred", exc_info=True)

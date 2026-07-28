@@ -5,6 +5,7 @@ from tools.investigation.stages.gather_evidence.prompt import (
     build_investigation_system_prompt,
     format_alert_context,
 )
+from tools.investigation.stages.gather_evidence.tools import STAGNATION_NUDGE
 
 
 def test_build_investigation_system_prompt_non_hermes_uses_generic_category_instruction() -> None:
@@ -25,6 +26,50 @@ def test_build_investigation_system_prompt_includes_dependency_traversal_rule() 
     assert "does not bias localization" in prompt
 
 
+def test_build_investigation_system_prompt_includes_incident_command_phases() -> None:
+    prompt = build_investigation_system_prompt({"alert_source": "grafana"})
+
+    assert "incident commander" in prompt
+    assert "Investigation phases" in prompt
+    assert "Phase 1 — Triage" in prompt
+    assert "Phase 2 — Hypothesis" in prompt
+    assert "Phase 3 — Verification" in prompt
+    assert "Phase 4 — Mitigation" in prompt
+    assert "## How to work" not in prompt
+
+
+def test_build_investigation_system_prompt_includes_missing_context_rule() -> None:
+    prompt = build_investigation_system_prompt({"alert_source": "grafana"})
+
+    assert "Follow-up questions" in prompt
+    assert "Recent deploys" in prompt
+    assert "ending with `?`" in prompt
+    assert "Do not stall waiting for answers" in prompt
+
+
+def test_build_investigation_system_prompt_includes_alignment_and_tradeoffs() -> None:
+    prompt = build_investigation_system_prompt({"alert_source": "grafana"})
+
+    assert "Keeping the team aligned" in prompt
+    assert "Hypotheses:" in prompt
+    assert "Verification:" in prompt
+    assert "Follow-up questions:" in prompt
+    assert "Remediation trade-offs:" in prompt
+    assert "blast radius" in prompt
+    assert "reversibility" in prompt
+
+
+def test_stagnation_nudge_matches_incident_command_output_contract() -> None:
+    nudge = STAGNATION_NUDGE.lower()
+
+    assert "triage complete" in nudge
+    assert "status block" in nudge
+    assert "hypotheses" in nudge
+    assert "verification" in nudge
+    assert "follow-up questions" in nudge
+    assert "remediation trade-offs" in nudge
+
+
 def test_build_investigation_system_prompt_hermes_includes_hermes_taxonomy_only() -> None:
     prompt = build_investigation_system_prompt({"alert_source": "hermes"})
 
@@ -39,8 +84,8 @@ def test_generic_alert_matches_relevant_integration_by_content() -> None:
     context = format_alert_context(
         {
             "alert_name": "High error rate in payments ETL",
+            "raw_alert": {},
             "alert_source": "generic",
-            "pipeline_name": "payments_etl",
             "severity": "critical",
             "message": "payments_etl is failing with repeated database connection errors",
             "resolved_integrations": {
@@ -56,8 +101,8 @@ def test_generic_alert_excludes_unrelated_integrations() -> None:
     context = format_alert_context(
         {
             "alert_name": "High error rate in payments ETL",
+            "raw_alert": {},
             "alert_source": "generic",
-            "pipeline_name": "payments_etl",
             "severity": "critical",
             "message": "payments_etl is failing with repeated database connection errors",
             "resolved_integrations": {
@@ -77,8 +122,8 @@ def test_generic_alert_without_signal_does_not_fan_out() -> None:
     context = format_alert_context(
         {
             "alert_name": "Something went wrong",
+            "raw_alert": {},
             "alert_source": "generic",
-            "pipeline_name": "widgets",
             "severity": "critical",
             "message": "an unexpected problem occurred",
             "resolved_integrations": {
@@ -98,12 +143,11 @@ def test_generic_alert_without_signal_does_not_fan_out() -> None:
 def test_generic_alert_honors_context_sources_annotation() -> None:
     context = format_alert_context(
         {
-            "alert_name": "Something went wrong",
             "alert_source": "generic",
-            "pipeline_name": "widgets",
             "severity": "critical",
             "message": "an unexpected problem occurred",
             "raw_alert": {
+                "alert_name": "Something went wrong",
                 "commonAnnotations": {"context_sources": "datadog"},
             },
             "resolved_integrations": {
@@ -120,8 +164,8 @@ def test_alert_context_uses_planned_actions_when_present() -> None:
     context = format_alert_context(
         {
             "alert_name": "High error rate",
+            "raw_alert": {},
             "alert_source": "generic",
-            "pipeline_name": "payments",
             "severity": "critical",
             "planned_actions": ["get_sre_guidance"],
             "plan_rationale": "Knowledge guidance is the selected fallback.",
@@ -141,8 +185,8 @@ def test_alert_context_uses_planned_actions_when_present() -> None:
 def test_relevant_sources_matches_db_symptom_and_excludes_unrelated() -> None:
     state = {
         "alert_name": "High error rate in payments ETL",
+        "raw_alert": {},
         "alert_source": "generic",
-        "pipeline_name": "payments_etl",
         "message": "payments_etl is failing with repeated database connection errors",
     }
     tools_by_source = {"postgresql": [], "vercel": [], "knowledge": []}
@@ -155,8 +199,8 @@ def test_relevant_sources_matches_db_symptom_and_excludes_unrelated() -> None:
 def test_relevant_sources_empty_when_no_content_signal() -> None:
     state = {
         "alert_name": "Something is wrong",
+        "raw_alert": {},
         "alert_source": "generic",
-        "pipeline_name": "mystery",
         "message": "an unexplained problem occurred",
     }
     tools_by_source = {"postgresql": [], "vercel": []}
@@ -166,11 +210,12 @@ def test_relevant_sources_empty_when_no_content_signal() -> None:
 
 def test_relevant_sources_honors_explicit_context_sources() -> None:
     state = {
-        "alert_name": "Something is wrong",
         "alert_source": "generic",
-        "pipeline_name": "mystery",
         "message": "an unexplained problem occurred",
-        "raw_alert": {"commonAnnotations": {"context_sources": "vercel"}},
+        "raw_alert": {
+            "alert_name": "Something is wrong",
+            "commonAnnotations": {"context_sources": "vercel"},
+        },
     }
     tools_by_source = {"postgresql": [], "vercel": []}
 
@@ -178,12 +223,48 @@ def test_relevant_sources_honors_explicit_context_sources() -> None:
     assert _relevant_sources(state, tools_by_source) == ["vercel"]
 
 
+def test_alert_context_includes_incident_window_since_until_keys() -> None:
+    context = format_alert_context(
+        {
+            "alert_name": "Kubernetes job failed",
+            "raw_alert": {},
+            "alert_source": "generic",
+            "severity": "critical",
+            "incident_window": {
+                "since": "2026-02-18T22:10:00Z",
+                "until": "2026-02-19T00:10:00Z",
+                "source": "alert.startsAt",
+                "confidence": 1.0,
+            },
+        }
+    )
+
+    assert "Incident window: 2026-02-18T22:10:00Z → 2026-02-19T00:10:00Z" in context
+
+
+def test_alert_context_accepts_legacy_incident_window_start_end_keys() -> None:
+    context = format_alert_context(
+        {
+            "alert_name": "Legacy window shape",
+            "raw_alert": {},
+            "alert_source": "generic",
+            "severity": "warning",
+            "incident_window": {
+                "start": "2026-01-01T00:00:00Z",
+                "end": "2026-01-01T02:00:00Z",
+            },
+        }
+    )
+
+    assert "Incident window: 2026-01-01T00:00:00Z → 2026-01-01T02:00:00Z" in context
+
+
 def test_alert_context_points_to_primary_source_without_duplicating_tool_metadata() -> None:
     context = format_alert_context(
         {
             "alert_name": "RDS latency spike",
+            "raw_alert": {},
             "alert_source": "rds",
-            "pipeline_name": "orders",
             "severity": "critical",
             "resolved_integrations": {
                 "rds": {"db_instance_identifier": "orders-db", "region": "us-east-1"},

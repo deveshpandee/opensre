@@ -14,6 +14,8 @@ def _assert_investigation_events_have_source(
         Event.INVESTIGATION_STARTED,
         Event.INVESTIGATION_COMPLETED,
         Event.INVESTIGATION_FAILED,
+        Event.INVESTIGATION_OUTCOME,
+        Event.INVESTIGATION_CANCELLED,
     }
     for event, properties in events:
         if event not in investigation_events:
@@ -22,6 +24,12 @@ def _assert_investigation_events_have_source(
         source = properties.get("source")
         assert isinstance(source, str), f"{event.value} must include a string source"
         assert source.strip(), f"{event.value} source must be non-empty"
+        assert properties.get("investigation_loop_count") is not None, (
+            f"{event.value} must include investigation_loop_count"
+        )
+        assert properties.get("investigation_iteration_cap") is not None, (
+            f"{event.value} must include investigation_iteration_cap"
+        )
 
 
 class _StubAnalytics:
@@ -134,11 +142,81 @@ def test_capture_github_login_completed(monkeypatch: pytest.MonkeyPatch) -> None
     stub = _StubAnalytics()
     monkeypatch.setattr(cli, "get_analytics", lambda: stub)
 
-    cli.capture_github_login_completed("octocat")
+    cli.capture_github_login_completed("octocat", variant="forced")
 
     assert stub.events == [
-        (Event.GITHUB_LOGIN_COMPLETED, {"github_username": "octocat"}),
+        (
+            Event.GITHUB_LOGIN_COMPLETED,
+            {
+                "github_username": "octocat",
+                "experiment_key": cli.GITHUB_GATE_EXPERIMENT,
+                "variant": "forced",
+                "gate_version": cli.GITHUB_GATE_VERSION,
+                "github_gate_variant": "forced",
+            },
+        ),
     ]
+
+
+def test_assign_github_gate_variant_is_deterministic() -> None:
+    a = cli.assign_github_gate_variant("11111111-2222-3333-4444-555555555555")
+    b = cli.assign_github_gate_variant("11111111-2222-3333-4444-555555555555")
+    c = cli.assign_github_gate_variant("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    assert a == b
+    assert a in {cli.GITHUB_GATE_VARIANT_CONTROL, cli.GITHUB_GATE_VARIANT_FORCED}
+    # Different ids should usually split; assert both variants exist across a sample.
+    variants = {
+        cli.assign_github_gate_variant(f"00000000-0000-0000-0000-{i:012d}") for i in range(40)
+    }
+    assert variants == {cli.GITHUB_GATE_VARIANT_CONTROL, cli.GITHUB_GATE_VARIANT_FORCED}
+    assert c in variants
+
+
+def test_resolve_github_gate_variant_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENSRE_GITHUB_GATE_VARIANT", "forced")
+    assert cli.resolve_github_gate_variant() == "forced"
+    monkeypatch.setenv("OPENSRE_GITHUB_GATE_VARIANT", "control")
+    assert cli.resolve_github_gate_variant() == "control"
+
+
+def test_capture_github_login_lifecycle_events(monkeypatch: pytest.MonkeyPatch) -> None:
+    stub = _StubAnalytics()
+    monkeypatch.setattr(cli, "get_analytics", lambda: stub)
+
+    cli.capture_github_login_prompted(variant="control")
+    cli.capture_github_login_skipped(variant="control", skip_source=cli.GITHUB_SKIP_SOURCE_MENU)
+    cli.capture_github_login_abandoned(variant="forced", reason="cancelled")
+    cli.capture_github_login_failed(variant="forced", reason_category=cli.GITHUB_FAIL_DEVICE_FLOW)
+    cli.stamp_github_gate_variant("forced")
+
+    exp_control = cli.github_gate_experiment_properties("control")
+    exp_forced = cli.github_gate_experiment_properties("forced")
+    assert stub.events == [
+        (Event.GITHUB_LOGIN_GATE_SHOWN, exp_control),
+        (Event.GITHUB_LOGIN_PROMPTED, exp_control),
+        (
+            Event.GITHUB_LOGIN_SKIPPED,
+            {**exp_control, "skip_source": cli.GITHUB_SKIP_SOURCE_MENU},
+        ),
+        (
+            Event.GITHUB_LOGIN_ABANDONED,
+            {**exp_forced, "reason": "cancelled"},
+        ),
+        (
+            Event.GITHUB_LOGIN_FAILED,
+            {**exp_forced, "reason_category": cli.GITHUB_FAIL_DEVICE_FLOW},
+        ),
+    ]
+    assert stub.persistent_properties == exp_forced
+
+
+def test_github_gate_experiment_properties_shape() -> None:
+    props = cli.github_gate_experiment_properties("control", skip_source="menu")
+    assert props["experiment_key"] == "github_gate_v1"
+    assert props["variant"] == "control"
+    assert props["gate_version"] == "1"
+    assert props["github_gate_variant"] == "control"
+    assert props["skip_source"] == "menu"
 
 
 def test_build_cli_invoked_properties_includes_full_command_path() -> None:
@@ -287,6 +365,8 @@ def test_track_investigation_emits_lifecycle_once(monkeypatch: pytest.MonkeyPatc
     assert started_props["trigger_mode"] == "file"
     assert started_props["is_test"] is True
     assert started_props["investigation_id"] == completed_props["investigation_id"]
+    assert started_props["investigation_loop_count"] == 0
+    assert completed_props["investigation_loop_count"] == 0
 
 
 def test_track_investigation_emits_failed_on_exception(
@@ -318,6 +398,48 @@ def test_track_investigation_emits_failed_on_exception(
     assert failed_props["failure_message"] == "boom"
 
 
+def test_capture_investigation_failed_includes_state_loop_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub = _StubAnalytics()
+    monkeypatch.setattr(cli, "get_analytics", lambda: stub)
+
+    cli.capture_investigation_failed(
+        failure_type="RuntimeError",
+        failure_message="boom",
+        shared_properties={"investigation_id": "inv-fail"},
+        state={"investigation_loop_count": 4, "investigation_iteration_cap": 20},
+    )
+
+    failed_props = stub.events[0][1] or {}
+    assert failed_props["investigation_loop_count"] == 4
+    assert failed_props["investigation_iteration_cap"] == 20
+
+
+def test_track_investigation_failed_uses_tracker_loop_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub = _StubAnalytics()
+    monkeypatch.setattr(cli, "get_analytics", lambda: stub)
+
+    def _trigger() -> None:
+        with cli.track_investigation(
+            entrypoint=EntrypointSource.CLI_COMMAND,
+            trigger_mode=TriggerMode.FILE,
+        ) as tracker:
+            tracker.record_loop_metrics_from_state(
+                {"investigation_loop_count": 6, "investigation_iteration_cap": 20}
+            )
+            raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        _trigger()
+
+    failed_props = stub.events[1][1] or {}
+    assert failed_props["investigation_loop_count"] == 6
+    assert failed_props["investigation_iteration_cap"] == 20
+
+
 def test_capture_investigation_outcome_and_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
     stub = _StubAnalytics()
     monkeypatch.setattr(cli, "get_analytics", lambda: stub)
@@ -328,10 +450,12 @@ def test_capture_investigation_outcome_and_cancelled(monkeypatch: pytest.MonkeyP
         investigation_target="generic",
         error_excerpt="boom",
         failure_category="unknown",
+        state={"investigation_loop_count": 5, "investigation_iteration_cap": 20},
     )
     cli.capture_investigation_cancelled(
         investigation_id="inv-456",
         investigation_target="alert.json",
+        state={"investigation_loop_count": 2, "investigation_iteration_cap": 20},
     )
 
     assert stub.events[0][0] == Event.INVESTIGATION_OUTCOME
@@ -340,10 +464,31 @@ def test_capture_investigation_outcome_and_cancelled(monkeypatch: pytest.MonkeyP
     assert outcome_props["status"] == "failed"
     assert outcome_props["investigation_target"] == "generic"
     assert outcome_props["error_excerpt"] == "boom"
+    assert outcome_props["investigation_loop_count"] == 5
     assert stub.events[1][0] == Event.INVESTIGATION_CANCELLED
     cancelled_props = stub.events[1][1] or {}
     assert cancelled_props["investigation_id"] == "inv-456"
     assert cancelled_props["failure_category"] == "user_cancelled"
+    assert cancelled_props["investigation_loop_count"] == 2
+
+
+def test_track_investigation_records_loop_metrics_on_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub = _StubAnalytics()
+    monkeypatch.setattr(cli, "get_analytics", lambda: stub)
+
+    with cli.track_investigation(
+        entrypoint=EntrypointSource.CLI_COMMAND,
+        trigger_mode=TriggerMode.FILE,
+    ) as tracker:
+        tracker.record_loop_metrics_from_state(
+            {"investigation_loop_count": 8, "investigation_iteration_cap": 20}
+        )
+
+    completed_props = stub.events[1][1] or {}
+    assert completed_props["investigation_loop_count"] == 8
+    assert completed_props["investigation_iteration_cap"] == 20
 
 
 def test_track_investigation_nested_context_dedupes(monkeypatch: pytest.MonkeyPatch) -> None:

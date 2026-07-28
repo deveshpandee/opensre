@@ -6,11 +6,11 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 
-from core.domain.types.evidence import EvidenceSource
+from integrations.elasticsearch.tools import query_elasticsearch_logs
 
 
 def test_evidence_source_includes_elasticsearch() -> None:
-    assert "elasticsearch" in EvidenceSource.__args__  # type: ignore[attr-defined]
+    assert query_elasticsearch_logs.source == "elasticsearch"
 
 
 # ── Config tests ─────────────────────────────────────────────────────────────
@@ -387,10 +387,13 @@ def test_tool_name_and_source() -> None:
 
 
 def test_tool_is_available_when_connection_verified() -> None:
+    # Shares the "opensearch" source (same client, same credentials) — see
+    # docs/opensearch.mdx: configuring OpenSearch/Elasticsearch once enables
+    # both the analytics tool and this log-search tool.
     from integrations.elasticsearch.tools import ElasticsearchLogsTool
 
     t = ElasticsearchLogsTool()
-    sources = {"elasticsearch": {"connection_verified": True, "url": "http://localhost:9200"}}
+    sources = {"opensearch": {"connection_verified": True, "url": "http://localhost:9200"}}
     assert t.is_available(sources) is True
 
 

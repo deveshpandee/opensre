@@ -19,17 +19,37 @@ from surfaces.interactive_shell.ui import (
 )
 
 
+def _flush_analytics_on_exit(console: Console) -> None:
+    """Best-effort PostHog drain with a spinner so /quit is not silent or fire-and-forget."""
+    from platform.analytics.provider import analytics_needs_flush, shutdown_analytics
+
+    if not analytics_needs_flush():
+        shutdown_analytics(flush=False)
+        return
+
+    if console.is_terminal:
+        with console.status(
+            f"[{DIM}]finishing up…[/]",
+            spinner="dots",
+            spinner_style=DIM,
+        ):
+            shutdown_analytics(flush=True)
+    else:
+        shutdown_analytics(flush=True)
+
+
 def _cmd_exit(session: Session, console: Console, _args: list[str]) -> bool:
     if session.session_id:
         console.print()
         print_session_resume_hint(console, session.session_id)
+    _flush_analytics_on_exit(console)
     console.print(f"[{DIM}]goodbye.[/]")
     return False
 
 
 def _cmd_health(_session: Session, console: Console, _args: list[str]) -> bool:
     from config.config import get_environment
-    from integrations.store import STORE_PATH
+    from config.constants.paths import integrations_store_path
     from integrations.verify import verify_integrations
     from surfaces.interactive_shell.ui.health import render_health_report
 
@@ -38,7 +58,7 @@ def _cmd_health(_session: Session, console: Console, _args: list[str]) -> bool:
     render_health_report(
         console=console,
         environment=environment,
-        integration_store_path=STORE_PATH,
+        integration_store_path=integrations_store_path(),
         results=results,
     )
     return True
@@ -71,12 +91,12 @@ def _cmd_doctor(_session: Session, console: Console, _args: list[str]) -> bool:
 
 
 def _cmd_version(_session: Session, console: Console, _args: list[str]) -> bool:
-    from config.version import get_version
+    from config.version import get_opensre_version
 
     table = repl_table(title="Version info\n", title_style=BOLD_BRAND, show_header=False)
     table.add_column("key", style="bold")
     table.add_column("value")
-    table.add_row("opensre", get_version())
+    table.add_row("opensre", get_opensre_version())
     table.add_row("python", platform.python_version())
     table.add_row("os", f"{platform.system().lower()} ({platform.machine()})")
     print_repl_table(console, table)

@@ -13,7 +13,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from config.llm_reasoning_effort import get_active_reasoning_effort
-from core.llm.structured_output import StructuredOutputClient
+from core.llm.shared.structured_output import StructuredOutputClient
 from core.llm.types import LLMResponse
 from integrations.llm_cli.base import CLIProbe, LLMCLIAdapter
 from integrations.llm_cli.constants import (
@@ -112,9 +112,6 @@ class CLIBackedLLMClient:
     def with_structured_output(self, model: type[BaseModel]) -> Any:
         """JSON-schema prompt + parse; same contract as API `StructuredOutputClient`."""
         return StructuredOutputClient(self, model)
-
-    def bind_tools(self, _tools: list[Any]) -> CLIBackedLLMClient:
-        return self
 
     def invoke(self, prompt_or_messages: Any) -> LLMResponse:
         # max_tokens / model_type are stored for API parity but ignored here:

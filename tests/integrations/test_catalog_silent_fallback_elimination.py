@@ -4,7 +4,11 @@ Three patterns previously dropped exceptions to ``(None, None)``, ``pass``,
 or ``logger.debug(..., exc_info=True)`` with no Sentry trace:
 
   A. ``_classify_service_instance`` per-vendor ``try/except Exception``
-     blocks (33 sites covering grafana .. supabase).
+     blocks (38 sites covering grafana .. whatsapp; bitbucket/signoz/tempo/
+     twilio/whatsapp were fixed in a later pass — see
+     ``integrations._validation_helpers.report_classify_failure``, which now
+     centrally wraps ``pydantic.ValidationError`` so no vendor classifier has
+     to duplicate that guard itself).
   B. ``load_env_integrations`` argocd + helm ``except Exception: pass``.
   C. ``load_env_integrations`` debug-only env loaders (incident_io,
      openclaw, mariadb, rabbitmq, rds, betterstack, alertmanager,
@@ -120,6 +124,16 @@ _CLASSIFY_PATCH_TARGETS: list[tuple[str, str, str]] = [
     ("victoria_logs", "integrations.victoria_logs", "VictoriaLogsIntegrationConfig"),
     ("splunk", "integrations.splunk", "SplunkIntegrationConfig"),
     ("supabase", "integrations.supabase", "build_supabase_config"),
+    ("smtp", "integrations.smtp", "SMTPIntegrationConfig"),
+    # Previously silent or partially-reported (bitbucket/signoz/tempo dropped to
+    # (None, None) with no report at all; twilio/whatsapp swallowed ValidationError
+    # specifically). All five now route through report_classify_failure like every
+    # other vendor above.
+    ("bitbucket", "integrations.bitbucket", "BitbucketConfig"),
+    ("signoz", "integrations.signoz", "build_signoz_config"),
+    ("tempo", "integrations.tempo", "build_tempo_config"),
+    ("twilio", "integrations.twilio", "TwilioIntegrationConfig"),
+    ("whatsapp", "integrations.whatsapp", "WhatsAppConfig"),
 ]
 
 
@@ -378,9 +392,13 @@ def test_env_loader_failure_reports_and_skips(
     integration must be skipped (preserving the historic caller contract)
     *and* the failure must reach Sentry via ``report_exception``."""
     # Clear ambient env so other integrations on the dev box don't enable
-    # unrelated paths and inflate the assertion.
+    # unrelated paths and inflate the assertion. Disable keyring too —
+    # secret fields resolve via resolve_env_credential (env then keyring),
+    # and a wiped env without this flag can hammer a broken session keyring
+    # under xdist or leak secrets from a prior MemoryKeyring fixture.
     for var in list(os.environ):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("OPENSRE_DISABLE_KEYRING", "1")
     for var, value in env.items():
         monkeypatch.setenv(var, value)
 
@@ -424,6 +442,7 @@ def test_one_failing_env_loader_does_not_abort_remaining_integrations(
     """
     for var in list(os.environ):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("OPENSRE_DISABLE_KEYRING", "1")
     monkeypatch.setenv("VERCEL_API_TOKEN", "tkn")
     monkeypatch.setenv("INCIDENT_IO_API_KEY", "tkn")
 

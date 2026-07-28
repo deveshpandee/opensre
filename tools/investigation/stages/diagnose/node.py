@@ -7,16 +7,16 @@ from typing import Any, TypedDict, cast
 
 from pydantic import BaseModel
 
-from core.context.state import InvestigationState
 from core.domain.alerts.alert_source import resolve_alert_source
 from core.domain.diagnosis import (
     InvestigationResult,
     build_diagnosis_schema,
     build_investigation_result,
-    extract_last_assistant_text,
     result_to_state,
     taxonomy_categories_for_alert_source,
 )
+from core.messages.transcript import extract_last_assistant_text
+from core.state import InvestigationState
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +97,7 @@ def _parse_via_structured_output(
     *,
     alert_source: str = "",
 ) -> InvestigationResult:
-    from core.llm.llm_client import get_llm_for_reasoning
+    from core.llm.factory import LLMRole, get_llm
 
     prompt = f"""Extract the structured diagnosis from this investigation conclusion.
 
@@ -105,6 +105,14 @@ Investigation conclusion:
 {last_text}
 
 Evidence keys collected: {", ".join(evidence.keys()) if evidence else "none"}
+
+Extract incident-command fields when present:
+- triage_summary: the one-line scope after "Triage complete"
+- incident_status: the full "Status — ..." block
+- investigation_hypotheses: each hypothesis from the "Hypotheses:" section
+- verification_summary: each verification line from the "Verification:" section
+- follow_up_questions: each direct question from the "Follow-up questions:" section
+- remediation_tradeoffs: the remediation trade-offs section, or "N/A — single clear fix path"
 """
 
     class _DiagnosisPayload(TypedDict):
@@ -114,9 +122,15 @@ Evidence keys collected: {", ".join(evidence.keys()) if evidence else "none"}
         validated_claims: list[str]
         non_validated_claims: list[str]
         remediation_steps: list[str]
+        triage_summary: str
+        incident_status: str
+        investigation_hypotheses: list[str]
+        verification_summary: list[str]
+        follow_up_questions: list[str]
+        remediation_tradeoffs: str
         validity_score: float
 
-    llm = get_llm_for_reasoning()
+    llm = get_llm(LLMRole.REASONING)
     schema_model = build_diagnosis_schema(taxonomy_categories_for_alert_source(alert_source))
     raw_schema = (
         llm.with_structured_output(schema_model)
@@ -136,6 +150,12 @@ Evidence keys collected: {", ".join(evidence.keys()) if evidence else "none"}
         non_validated_claims=schema["non_validated_claims"],
         remediation_steps=schema["remediation_steps"],
         validity_score=schema["validity_score"],
+        triage_summary=schema.get("triage_summary", ""),
+        incident_status=schema.get("incident_status", ""),
+        investigation_hypotheses=schema.get("investigation_hypotheses", []),
+        verification_summary=schema.get("verification_summary", []),
+        follow_up_questions=schema.get("follow_up_questions", []),
+        remediation_tradeoffs=schema.get("remediation_tradeoffs", ""),
         alert_source=alert_source,
     )
 
@@ -147,7 +167,7 @@ def _parse_via_legacy(
     *,
     alert_source: str = "",
 ) -> InvestigationResult:
-    from core.llm.llm_client import parse_root_cause
+    from core.llm.parsers.root_cause import parse_root_cause
 
     try:
         rr = parse_root_cause(last_text)

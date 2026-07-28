@@ -2,13 +2,21 @@
 
 AWS EC2 deployment and shared provisioning primitives for OpenSRE.
 
+**Scope: Telegram only.** Slack is deployed and operated separately, not from
+this repo. The EC2 paths here never ship `SLACK_*` variables: Socket Mode is
+single-consumer, so a second gateway holding the same tokens would split events.
+
 ## What's here
 
 | Path | Purpose |
 | --- | --- |
 | [`aws/`](aws/) | Shared AWS SDK primitives (`client`, `config`, VPC/SG, EC2/IAM, ECR, SSM). |
-| `lifecycle.py`, `prep.py`, `stack.py`, `instance.py` | EC2 provisioning: `opensre-web` + `opensre-gateway` on one instance. |
+| [`ecr_deploy/`](ecr_deploy/) | Docker/ECR EC2 provisioning: `opensre-web` + `opensre-gateway` on one instance. |
+| [`gateway/`](gateway/) | AMI + systemd deployment path for the Telegram gateway (no Docker/ECR). See [gateway/README.md](gateway/README.md). |
 | `install-proxy/` | Install proxy utility (Cloudflare Worker). |
+
+The Slack backend (web API + Slack gateway) is **not** in this repo — it is
+deployed and operated separately.
 
 ## EC2 deploy commands
 
@@ -23,8 +31,8 @@ Run from the **repo root**. Requires `make install` first.
 Equivalent Python entrypoints:
 
 ```bash
-uv run python -m platform.deployment.lifecycle deploy
-uv run python -m platform.deployment.lifecycle destroy
+uv run python -m platform.deployment.ecr_deploy.lifecycle deploy
+uv run python -m platform.deployment.ecr_deploy.lifecycle destroy
 ```
 
 ### Prerequisites
@@ -48,6 +56,9 @@ Copy [`.env.deploy.example`](../../.env.deploy.example) to `.env` in the repo ro
 | `TELEGRAM_ALLOWED_USERS` | Recommended | Gateway pairing gate |
 | `LLM_PROVIDER` + API key | Yes | Both containers |
 | `EC2_KEY_NAME` | No | Optional SSH debug key pair |
+
+`SLACK_*` variables are ignored by the EC2 deploy (warning at validation) —
+Slack is deployed and operated separately, not from this repo.
 
 ### What `make deploy` creates
 

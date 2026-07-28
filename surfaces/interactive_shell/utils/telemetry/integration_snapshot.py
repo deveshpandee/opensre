@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
-from core.domain.alerts.alert_source import SECONDARY_TOOL_SOURCES
+from core.domain.alerts.alert_source import secondary_tool_sources
 from integrations.registry import family_key
 from tools.investigation.stages.gather_evidence.tools import get_available_tools
 
@@ -43,7 +43,7 @@ def _resolved_integrations(session: _IntegrationSession | None) -> dict[str, Any
     if session is not None and session.resolved_integrations_cache is not None:
         return session.resolved_integrations_cache
     try:
-        from core.agent_harness.integrations.resolution import resolve_integrations
+        from core.agent_harness.session.integration_resolution import resolve_integrations
 
         return resolve_integrations()
     except Exception:
@@ -55,10 +55,9 @@ def _connected_slugs(configured: list[str], resolved: dict[str, Any]) -> list[st
         return []
     try:
         tools = get_available_tools(resolved)
+        secondary = secondary_tool_sources()
         active_families = {
-            family_key(str(tool.source))
-            for tool in tools
-            if str(tool.source) not in SECONDARY_TOOL_SOURCES
+            family_key(str(tool.source)) for tool in tools if str(tool.source) not in secondary
         }
         if not active_families:
             return []

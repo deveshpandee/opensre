@@ -8,10 +8,19 @@ from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import TYPE_CHECKING, Final
 from uuid import uuid4
 
+from config.constants.investigation import MAX_INVESTIGATION_LOOPS
 from platform.analytics.events import Event
+from platform.analytics.investigation_loop import (
+    begin_investigation_loop_metrics_scope,
+    bound_loop_metrics,
+    loop_metrics_from_state,
+    merge_loop_properties,
+    reset_investigation_loop_metrics,
+)
 from platform.analytics.provider import Properties, get_analytics
 from platform.analytics.repl_context import get_cli_session_id
 from platform.analytics.source import (
@@ -19,10 +28,11 @@ from platform.analytics.source import (
     TriggerMode,
     build_source_properties,
 )
-from platform.observability.sentry_sdk import capture_exception
+from platform.analytics.usage_context import SURFACE_CLI
+from platform.observability.errors.sentry import capture_exception
 
 if TYPE_CHECKING:
-    from core.agent_harness.session import Session
+    from core.agent_harness.session import SessionCore
 
 EVAL_AND_TERMINAL_KPI_QUERIES: Final[dict[str, str]] = {
     "eval_pass_rate": """
@@ -141,6 +151,14 @@ class InvestigationTracker:
     enabled: bool
     completed: bool = False
     failed: bool = False
+    investigation_loop_count: int | None = None
+    investigation_iteration_cap: int = MAX_INVESTIGATION_LOOPS
+
+    def record_loop_metrics_from_state(self, state: Mapping[str, object] | None) -> None:
+        """Capture canonical loop metrics from the investigation final state."""
+        loop_count, iteration_cap = loop_metrics_from_state(state)
+        self.investigation_loop_count = loop_count
+        self.investigation_iteration_cap = iteration_cap
 
 
 def _string_value(value: object) -> str | None:
@@ -149,6 +167,51 @@ def _string_value(value: object) -> str | None:
 
 def _mapping_value(mapping: Mapping[str, object], key: str) -> str | None:
     return _string_value(mapping.get(key))
+
+
+def _resolve_investigation_loop_metrics(
+    *,
+    loop_count: int | None = None,
+    iteration_cap: int | None = None,
+    state: Mapping[str, object] | None = None,
+    tracker: InvestigationTracker | None = None,
+) -> tuple[int, int]:
+    if loop_count is not None:
+        resolved_cap = (
+            iteration_cap
+            if iteration_cap is not None
+            else (
+                tracker.investigation_iteration_cap
+                if tracker is not None
+                else MAX_INVESTIGATION_LOOPS
+            )
+        )
+        return max(0, int(loop_count)), max(1, int(resolved_cap))
+    bound = bound_loop_metrics()
+    if bound is not None:
+        return bound
+    if state is not None:
+        return loop_metrics_from_state(state)
+    if tracker is not None and tracker.investigation_loop_count is not None:
+        return tracker.investigation_loop_count, tracker.investigation_iteration_cap
+    return 0, MAX_INVESTIGATION_LOOPS
+
+
+def _with_investigation_loop_metrics(
+    properties: Properties,
+    *,
+    loop_count: int | None = None,
+    iteration_cap: int | None = None,
+    state: Mapping[str, object] | None = None,
+    tracker: InvestigationTracker | None = None,
+) -> Properties:
+    count, cap = _resolve_investigation_loop_metrics(
+        loop_count=loop_count,
+        iteration_cap=iteration_cap,
+        state=state,
+        tracker=tracker,
+    )
+    return merge_loop_properties(properties, loop_count=count, iteration_cap=cap)
 
 
 def _onboard_completed_properties(config: Mapping[str, object]) -> Properties:
@@ -200,11 +263,24 @@ def _investigation_started_properties(
         properties["llm_provider"] = llm_provider
     if llm_model is not None:
         properties["llm_model"] = llm_model
-    return properties
+    return _with_investigation_loop_metrics(
+        properties,
+        loop_count=0,
+        iteration_cap=MAX_INVESTIGATION_LOOPS,
+    )
 
 
-def _investigation_completed_properties(*, shared_properties: Properties) -> Properties:
-    return {**shared_properties}
+def _investigation_completed_properties(
+    *,
+    shared_properties: Properties,
+    tracker: InvestigationTracker | None = None,
+    state: Mapping[str, object] | None = None,
+) -> Properties:
+    return _with_investigation_loop_metrics(
+        {**shared_properties},
+        state=state,
+        tracker=tracker,
+    )
 
 
 def _investigation_failed_properties(
@@ -217,6 +293,8 @@ def _investigation_failed_properties(
     integration_involved: str | None = None,
     integration_failure_message: str | None = None,
     investigation_target: str | None = None,
+    state: Mapping[str, object] | None = None,
+    tracker: InvestigationTracker | None = None,
 ) -> Properties:
     properties: Properties = {**shared_properties}
     if failure_type:
@@ -233,7 +311,7 @@ def _investigation_failed_properties(
         properties["integration_failure_message"] = integration_failure_message
     if investigation_target:
         properties["investigation_target"] = investigation_target
-    return properties
+    return _with_investigation_loop_metrics(properties, state=state, tracker=tracker)
 
 
 def _investigation_outcome_properties(
@@ -247,6 +325,7 @@ def _investigation_outcome_properties(
     integration_involved: str | None = None,
     integration_failure_message: str | None = None,
     failure_detail: str | None = None,
+    state: Mapping[str, object] | None = None,
 ) -> Properties:
     properties: Properties = {
         "investigation_id": investigation_id,
@@ -268,7 +347,29 @@ def _investigation_outcome_properties(
     session_id = get_cli_session_id()
     if session_id:
         properties["cli_session_id"] = session_id
-    return properties
+    return _with_investigation_loop_metrics(properties, state=state)
+
+
+def capture_investigation_lifecycle_event(
+    event: Event,
+    properties: Properties,
+    *,
+    state: Mapping[str, object] | None = None,
+    tracker: InvestigationTracker | None = None,
+    loop_count: int | None = None,
+    iteration_cap: int | None = None,
+) -> None:
+    """Capture an investigation lifecycle event with canonical loop metrics."""
+    _capture(
+        event,
+        _with_investigation_loop_metrics(
+            properties,
+            loop_count=loop_count,
+            iteration_cap=iteration_cap,
+            state=state,
+            tracker=tracker,
+        ),
+    )
 
 
 def _capture(event: Event, properties: Properties | None = None) -> None:
@@ -367,7 +468,62 @@ def build_cli_invoked_properties(
 
 
 def capture_cli_invoked(properties: Properties | None = None) -> None:
-    _capture(Event.CLI_INVOKED, properties)
+    # Whole-process default for local CLI; gateway binds surface per turn instead.
+    try:
+        from platform.analytics.usage_context import ensure_process_session_id
+
+        analytics = get_analytics()
+        analytics.set_persistent_property("surface", SURFACE_CLI)
+        ensure_process_session_id()
+        analytics.capture(Event.CLI_INVOKED, properties)
+    except Exception as exc:
+        capture_exception(exc)
+
+
+def capture_gateway_turn_started(*, surface: str) -> None:
+    """Mark the start of one Slack/Telegram gateway agent turn."""
+    _capture(Event.GATEWAY_TURN_STARTED, {"surface": surface})
+
+
+def capture_gateway_turn_completed(
+    *,
+    surface: str,
+    duration_ms: float,
+    answered: bool,
+    final_intent: str | None = None,
+) -> None:
+    """Mark successful completion of one gateway agent turn."""
+    props: Properties = {
+        "surface": surface,
+        "duration_ms": round(duration_ms),
+        "duration_bucket": _bucket_duration_ms(duration_ms),
+        "answered": answered,
+    }
+    if final_intent:
+        props["final_intent"] = final_intent
+    _capture(Event.GATEWAY_TURN_COMPLETED, props)
+
+
+def capture_gateway_turn_failed(
+    *,
+    surface: str | None,
+    duration_ms: float,
+    error_type: str,
+) -> None:
+    """Mark a failed gateway agent turn (exception during dispatch).
+
+    ``surface`` may be omitted when transport context was unbound so failures
+    still land in PostHog for regression detection.
+    """
+    props: Properties = {
+        "duration_ms": round(duration_ms),
+        "duration_bucket": _bucket_duration_ms(duration_ms),
+        "error_type": error_type,
+        "surface_missing": not bool(surface),
+    }
+    if surface:
+        props["surface"] = surface
+    _capture(Event.GATEWAY_TURN_FAILED, props)
 
 
 def capture_repl_execution_policy_decision(properties: Properties | None = None) -> None:
@@ -384,33 +540,6 @@ def capture_onboard_completed(config: Mapping[str, object]) -> None:
 
 def capture_onboard_failed() -> None:
     _capture(Event.ONBOARD_FAILED)
-
-
-def capture_investigation_started(
-    *,
-    input_path: str | None,
-    input_json: str | None,
-    interactive: bool,
-    entrypoint: EntrypointSource = EntrypointSource.CLI_COMMAND,
-    trigger_mode: TriggerMode = TriggerMode.FILE,
-    investigation_id: str | None = None,
-    evaluate_requested: bool = False,
-) -> None:
-    shared_properties = build_source_properties(
-        entrypoint=entrypoint,
-        trigger_mode=trigger_mode,
-        investigation_id=investigation_id or str(uuid4()),
-    )
-    _capture(
-        Event.INVESTIGATION_STARTED,
-        _investigation_started_properties(
-            input_path=input_path,
-            input_json=input_json,
-            interactive=interactive,
-            evaluate_requested=evaluate_requested,
-            shared_properties=shared_properties,
-        ),
-    )
 
 
 def capture_diagnosis_category_mismatch(
@@ -437,7 +566,10 @@ def capture_investigation_completed(*, tracker: InvestigationTracker | None = No
         return
     _capture(
         Event.INVESTIGATION_COMPLETED,
-        _investigation_completed_properties(shared_properties=tracker.shared_properties),
+        _investigation_completed_properties(
+            shared_properties=tracker.shared_properties,
+            tracker=tracker,
+        ),
     )
     tracker.completed = True
 
@@ -453,6 +585,7 @@ def capture_investigation_failed(
     integration_failure_message: str | None = None,
     investigation_target: str | None = None,
     shared_properties: Properties | None = None,
+    state: Mapping[str, object] | None = None,
 ) -> None:
     props = _investigation_failed_properties(
         shared_properties=shared_properties or (tracker.shared_properties if tracker else {}),
@@ -463,6 +596,8 @@ def capture_investigation_failed(
         integration_involved=integration_involved,
         integration_failure_message=integration_failure_message,
         investigation_target=investigation_target,
+        state=state,
+        tracker=tracker,
     )
     if tracker is None:
         _capture(Event.INVESTIGATION_FAILED, props)
@@ -479,6 +614,7 @@ def capture_investigation_cancelled(
     investigation_id: str,
     investigation_target: str = "",
     tracker: InvestigationTracker | None = None,
+    state: Mapping[str, object] | None = None,
 ) -> None:
     shared = tracker.shared_properties if tracker is not None and tracker.enabled else {}
     if investigation_id and not shared.get("investigation_id"):
@@ -489,7 +625,12 @@ def capture_investigation_cancelled(
     }
     if investigation_target:
         properties["investigation_target"] = investigation_target
-    _capture(Event.INVESTIGATION_CANCELLED, properties)
+    capture_investigation_lifecycle_event(
+        Event.INVESTIGATION_CANCELLED,
+        properties,
+        state=state,
+        tracker=tracker,
+    )
 
 
 def capture_investigation_outcome(
@@ -503,6 +644,7 @@ def capture_investigation_outcome(
     integration_involved: str | None = None,
     integration_failure_message: str | None = None,
     failure_detail: str | None = None,
+    state: Mapping[str, object] | None = None,
 ) -> None:
     if not investigation_id:
         return
@@ -518,6 +660,7 @@ def capture_investigation_outcome(
             integration_involved=integration_involved,
             integration_failure_message=integration_failure_message,
             failure_detail=failure_detail,
+            state=state,
         ),
     )
 
@@ -533,56 +676,65 @@ def track_investigation(
     evaluate_requested: bool = False,
     investigation_id: str | None = None,
     investigation_target: str | None = None,
-    session: Session | None = None,
+    session: SessionCore | None = None,
 ) -> Generator[InvestigationTracker]:
     """Capture investigation lifecycle once, with nested-call dedupe."""
+    from platform.analytics.usage_context import bound_usage_context
+
     depth = _INVESTIGATION_TRACKING_DEPTH.get()
     token = _INVESTIGATION_TRACKING_DEPTH.set(depth + 1)
-    tracker: InvestigationTracker
-    if depth > 0:
-        tracker = InvestigationTracker(shared_properties={}, enabled=False)
-    else:
-        resolved_id = investigation_id or str(uuid4())
-        shared_properties = build_source_properties(
-            entrypoint=entrypoint,
-            trigger_mode=trigger_mode,
-            investigation_id=resolved_id,
-        )
-        if investigation_target:
-            shared_properties["investigation_target"] = investigation_target
-        if session is not None:
-            session.last_investigation_id = resolved_id
-        _capture(
-            Event.INVESTIGATION_STARTED,
-            _investigation_started_properties(
-                input_path=input_path,
-                input_json=input_json,
-                interactive=interactive,
-                evaluate_requested=evaluate_requested,
-                shared_properties=shared_properties,
-            ),
-        )
-        tracker = InvestigationTracker(shared_properties=shared_properties, enabled=True)
+    loop_metrics_token = begin_investigation_loop_metrics_scope() if depth == 0 else None
+    session_id = str(getattr(session, "session_id", "") or "") or None
+    # Bind session for the full lifecycle so nested pipeline work (and callers
+    # that did not bind usage context) still stamp session_id explicitly.
+    with bound_usage_context(session_id=session_id):
+        tracker: InvestigationTracker
+        if depth > 0:
+            tracker = InvestigationTracker(shared_properties={}, enabled=False)
+        else:
+            resolved_id = investigation_id or str(uuid4())
+            shared_properties = build_source_properties(
+                entrypoint=entrypoint,
+                trigger_mode=trigger_mode,
+                investigation_id=resolved_id,
+            )
+            if investigation_target:
+                shared_properties["investigation_target"] = investigation_target
+            if session is not None:
+                session.last_investigation_id = resolved_id
+            _capture(
+                Event.INVESTIGATION_STARTED,
+                _investigation_started_properties(
+                    input_path=input_path,
+                    input_json=input_json,
+                    interactive=interactive,
+                    evaluate_requested=evaluate_requested,
+                    shared_properties=shared_properties,
+                ),
+            )
+            tracker = InvestigationTracker(shared_properties=shared_properties, enabled=True)
 
-    try:
-        yielded = tracker
-        yield yielded
-    except Exception as exc:
-        failure_message = str(exc).strip()[:500]
-        failure_detail = "".join(traceback.format_exception_only(exc)).strip()[:500]
-        capture_investigation_failed(
-            tracker=yielded,
-            failure_type=type(exc).__name__,
-            failure_message=failure_message or type(exc).__name__,
-            failure_detail=failure_detail or None,
-            investigation_target=investigation_target,
-        )
-        raise
-    else:
-        if not yielded.failed and not yielded.completed:
-            capture_investigation_completed(tracker=yielded)
-    finally:
-        _INVESTIGATION_TRACKING_DEPTH.reset(token)
+        try:
+            yielded = tracker
+            yield yielded
+        except Exception as exc:
+            failure_message = str(exc).strip()[:500]
+            failure_detail = "".join(traceback.format_exception_only(exc)).strip()[:500]
+            capture_investigation_failed(
+                tracker=yielded,
+                failure_type=type(exc).__name__,
+                failure_message=failure_message or type(exc).__name__,
+                failure_detail=failure_detail or None,
+                investigation_target=investigation_target,
+            )
+            raise
+        else:
+            if not yielded.failed and not yielded.completed:
+                capture_investigation_completed(tracker=yielded)
+        finally:
+            _INVESTIGATION_TRACKING_DEPTH.reset(token)
+            if depth == 0 and loop_metrics_token is not None:
+                reset_investigation_loop_metrics(loop_metrics_token)
 
 
 def capture_integration_setup_started(service: str) -> None:
@@ -644,8 +796,132 @@ def identify_github_username(username: str) -> None:
         capture_exception(exc)
 
 
-def capture_github_login_completed(username: str) -> None:
-    _capture(Event.GITHUB_LOGIN_COMPLETED, {"github_username": username})
+GITHUB_GATE_EXPERIMENT: Final[str] = "github_gate_v1"
+GITHUB_GATE_VERSION: Final[str] = "1"
+GITHUB_GATE_VARIANT_CONTROL: Final[str] = "control"
+GITHUB_GATE_VARIANT_FORCED: Final[str] = "forced"
+_GITHUB_GATE_VARIANTS: Final[frozenset[str]] = frozenset(
+    {GITHUB_GATE_VARIANT_CONTROL, GITHUB_GATE_VARIANT_FORCED}
+)
+GITHUB_GATE_VARIANT_ENV: Final[str] = "OPENSRE_GITHUB_GATE_VARIANT"
+
+# Real user-skip sources (never used for CI/test/env bypasses).
+GITHUB_SKIP_SOURCE_MENU: Final[str] = "menu"
+GITHUB_SKIP_SOURCE_ESCAPE: Final[str] = "escape"
+GITHUB_SKIP_SOURCE_DECLINE_RETRY: Final[str] = "decline_retry"
+
+GITHUB_FAIL_DEVICE_FLOW: Final[str] = "device_flow_unavailable"
+GITHUB_FAIL_TRANSPORT: Final[str] = "transport_error"
+GITHUB_FAIL_VERIFY: Final[str] = "access_unverified"
+
+
+def assign_github_gate_variant(anonymous_id: str) -> str:
+    """Deterministically assign ``control`` (skip allowed) or ``forced`` (no skip).
+
+    Buckets on the install anonymous id so the variant is sticky without a
+    PostHog feature-flag round-trip. Override with ``OPENSRE_GITHUB_GATE_VARIANT``.
+    """
+    digest = sha256(f"{GITHUB_GATE_EXPERIMENT}:{anonymous_id}".encode()).hexdigest()
+    return (
+        GITHUB_GATE_VARIANT_FORCED if int(digest[:8], 16) % 2 == 0 else GITHUB_GATE_VARIANT_CONTROL
+    )
+
+
+def resolve_github_gate_variant() -> str:
+    """Resolve the GitHub login-gate experiment variant for this install."""
+    override = os.getenv(GITHUB_GATE_VARIANT_ENV, "").strip().lower()
+    if override in _GITHUB_GATE_VARIANTS:
+        return override
+    from platform.analytics.provider import get_anonymous_id
+
+    return assign_github_gate_variant(get_anonymous_id())
+
+
+def github_gate_experiment_properties(variant: str, **extra: object) -> Properties:
+    """Shared experiment fields for GitHub gate exposure/outcome events."""
+    properties: Properties = {
+        "experiment_key": GITHUB_GATE_EXPERIMENT,
+        "variant": variant,
+        "gate_version": GITHUB_GATE_VERSION,
+        # Backward-compatible alias used by existing dashboards / persistent stamp.
+        "github_gate_variant": variant,
+    }
+    for key, value in extra.items():
+        if value is None:
+            continue
+        properties[key] = value  # type: ignore[assignment]
+    return properties
+
+
+def stamp_github_gate_variant(variant: str) -> None:
+    """Persist experiment fields on every subsequent analytics event.
+
+    Downstream events such as ``investigation_started`` inherit ``variant`` /
+    ``github_gate_variant`` via the anonymous ``distinct_id`` session, so
+    completed-vs-skipped and forced-vs-control cohorts can be joined without
+    using ``github_username``.
+    """
+    if variant not in _GITHUB_GATE_VARIANTS:
+        return
+    try:
+        analytics = get_analytics()
+        for key, value in github_gate_experiment_properties(variant).items():
+            analytics.set_persistent_property(key, value)  # type: ignore[arg-type]
+    except Exception as exc:
+        capture_exception(exc)
+
+
+def capture_github_login_gate_shown(*, variant: str) -> None:
+    """Exposure event: gate was rendered to an eligible interactive install."""
+    _capture(Event.GITHUB_LOGIN_GATE_SHOWN, github_gate_experiment_properties(variant))
+
+
+def capture_github_login_prompted(*, variant: str) -> None:
+    """Legacy alias for :func:`capture_github_login_gate_shown`.
+
+    Emits both ``github_login_gate_shown`` (canonical) and ``github_login_prompted``
+    (backward compatible) with identical experiment properties so existing
+    PostHog boards keep working during the rename.
+
+    Do **not** combine both event names in the same funnel step or ``event IN
+    (...)`` filter — each gate presentation produces two events and that query
+    would double-count exposures. Prefer ``github_login_gate_shown`` for new
+    boards; keep ``github_login_prompted`` only for legacy charts that have not
+    migrated yet.
+    """
+    props = github_gate_experiment_properties(variant)
+    _capture(Event.GITHUB_LOGIN_GATE_SHOWN, props)
+    _capture(Event.GITHUB_LOGIN_PROMPTED, props)
+
+
+def capture_github_login_skipped(*, variant: str, skip_source: str) -> None:
+    """User chose to skip (menu / Escape / decline retry). Never for CI bypasses."""
+    _capture(
+        Event.GITHUB_LOGIN_SKIPPED,
+        github_gate_experiment_properties(variant, skip_source=skip_source),
+    )
+
+
+def capture_github_login_abandoned(*, variant: str, reason: str) -> None:
+    _capture(
+        Event.GITHUB_LOGIN_ABANDONED,
+        github_gate_experiment_properties(variant, reason=reason),
+    )
+
+
+def capture_github_login_failed(*, variant: str, reason_category: str) -> None:
+    """Non-terminal failure during a gate attempt (device flow / transport / verify)."""
+    _capture(
+        Event.GITHUB_LOGIN_FAILED,
+        github_gate_experiment_properties(variant, reason_category=reason_category),
+    )
+
+
+def capture_github_login_completed(username: str, *, variant: str | None = None) -> None:
+    properties: Properties = {"github_username": username}
+    if variant is not None:
+        properties.update(github_gate_experiment_properties(variant))
+    _capture(Event.GITHUB_LOGIN_COMPLETED, properties)
 
 
 def capture_tests_picker_opened() -> None:
@@ -796,6 +1072,45 @@ def capture_terminal_actions_executed(
     )
 
 
+def capture_react_turn_completed(
+    *,
+    phase: str,
+    llm_iterations_used: int,
+    llm_iteration_cap: int,
+    hit_iteration_cap: bool,
+    stop_reason: str,
+    tool_calls_executed: int,
+    duration_ms: int,
+    cli_session_id: str,
+    cli_turn_kind: str,
+    llm_provider: str,
+    llm_model: str,
+    investigation_id: str | None = None,
+    investigation_loop_count: int | None = None,
+    prompt_turn_id: str | None = None,
+) -> None:
+    properties: Properties = {
+        "phase": phase,
+        "llm_iterations_used": llm_iterations_used,
+        "llm_iteration_cap": llm_iteration_cap,
+        "hit_iteration_cap": hit_iteration_cap,
+        "stop_reason": stop_reason,
+        "tool_calls_executed": tool_calls_executed,
+        "duration_ms": duration_ms,
+        "cli_session_id": cli_session_id,
+        "cli_turn_kind": cli_turn_kind,
+        "llm_provider": llm_provider,
+        "llm_model": llm_model,
+    }
+    if investigation_id:
+        properties["investigation_id"] = investigation_id
+    if investigation_loop_count is not None:
+        properties["investigation_loop_count"] = investigation_loop_count
+    if prompt_turn_id:
+        properties["prompt_turn_id"] = prompt_turn_id
+    _capture(Event.REACT_TURN_COMPLETED, properties)
+
+
 def capture_terminal_turn_summarized(
     *,
     planned_count: int,
@@ -820,18 +1135,6 @@ def capture_terminal_turn_summarized(
             "session_fallback_rate_bucket": _bucket_percentage(session_fallback_rate_percent),
         },
     )
-
-
-def capture_deploy_started(*, target: str, dry_run: bool) -> None:
-    _capture(Event.DEPLOY_STARTED, {"target": target, "dry_run": dry_run})
-
-
-def capture_deploy_completed(*, target: str, dry_run: bool) -> None:
-    _capture(Event.DEPLOY_COMPLETED, {"target": target, "dry_run": dry_run})
-
-
-def capture_deploy_failed(*, target: str, dry_run: bool) -> None:
-    _capture(Event.DEPLOY_FAILED, {"target": target, "dry_run": dry_run})
 
 
 def capture_update_started(*, check_only: bool) -> None:

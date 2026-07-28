@@ -6,7 +6,7 @@ import contextlib
 from collections.abc import Iterator
 from dataclasses import dataclass
 
-from core.llm.usage import set_usage_hook
+from core.llm.shared.usage import set_usage_hook
 
 
 @dataclass
@@ -27,7 +27,7 @@ def observe_investigation_llm_usage() -> Iterator[InvestigationLlmUsage]:
     """Accumulate provider-reported token usage while the body runs.
 
     Registration is best-effort: if another owner already holds the process-wide
-    usage hook (`core.llm.usage.set_usage_hook`), the investigation proceeds
+    usage hook (`core.llm.shared.usage.set_usage_hook`), the investigation proceeds
     without usage observation rather than failing.
     """
     usage = InvestigationLlmUsage()
@@ -39,11 +39,9 @@ def observe_investigation_llm_usage() -> Iterator[InvestigationLlmUsage]:
         usage.output_tokens += tokens_out
 
     registered = False
-    try:
+    with contextlib.suppress(RuntimeError):
         set_usage_hook(_hook)
         registered = True
-    except RuntimeError:
-        pass
     try:
         yield usage
     finally:

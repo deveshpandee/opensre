@@ -77,7 +77,7 @@ def mock_agent_state(overrides: dict | None = None) -> dict[str, Any]:
             "github_mode": "streamable-http",
             "github_token": "ghp_test",
         },
-        "elasticsearch": {
+        "opensearch": {
             "connection_verified": True,
             "url": "http://localhost:9200",
             "api_key": None,
@@ -174,6 +174,12 @@ def mock_agent_state(overrides: dict | None = None) -> dict[str, Any]:
         "temporal": {
             "base_url": "http://localhost:7233",
             "api_key": "",
+            "namespace": "default",
+        },
+        "kubernetes": {
+            "connection_verified": True,
+            "kubeconfig": "apiVersion: v1\nclusters: []\ncontexts: []\ncurrent-context: ''\nkind: Config\npreferences: {}\nusers: []\n",
+            "context": "",
             "namespace": "default",
         },
     }

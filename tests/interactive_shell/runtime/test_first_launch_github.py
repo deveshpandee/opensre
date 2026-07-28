@@ -10,6 +10,12 @@ from integrations.github.login import GitHubLoginResult
 from integrations.github.mcp import DEFAULT_GITHUB_MCP_TOOLSETS, DEFAULT_GITHUB_MCP_URL
 from integrations.github.mcp_oauth import GitHubDeviceCode
 from platform.analytics import source as analytics_source
+from platform.analytics.cli import (
+    GITHUB_FAIL_VERIFY,
+    GITHUB_SKIP_SOURCE_DECLINE_RETRY,
+    GITHUB_SKIP_SOURCE_ESCAPE,
+    GITHUB_SKIP_SOURCE_MENU,
+)
 from platform.terminal import theme as ui_theme
 from surfaces.interactive_shell.runtime.startup import first_launch_github as flg
 
@@ -28,6 +34,7 @@ def _force_required(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(flg, "is_test_run", lambda: False)
     monkeypatch.setattr(flg, "repl_tty_interactive", lambda: True)
     monkeypatch.setattr(flg, "_github_already_configured", lambda: False)
+    monkeypatch.setattr(flg, "read_github_login_deferred", lambda: False)
 
 
 def test_gate_required_when_all_conditions_met(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -98,6 +105,12 @@ def test_gate_skipped_in_ci_like_environment(
     assert flg.should_require_github_login() is False
 
 
+def test_gate_skipped_when_github_login_deferred(monkeypatch: pytest.MonkeyPatch) -> None:
+    _force_required(monkeypatch)
+    monkeypatch.setattr(flg, "read_github_login_deferred", lambda: True)
+    assert flg.should_require_github_login() is False
+
+
 def test_gate_required_when_stale_github_store_record_has_no_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -133,52 +146,262 @@ def test_device_code_prompt_highlights_user_code(monkeypatch: pytest.MonkeyPatch
         interval=5,
     )
 
-    flg._show_device_code(_terminal_console(output), code)
+    flg._show_device_code(_terminal_console(output), code, allow_skip=True)
 
     rendered = output.getvalue()
     assert f"{ui_theme.DEVICE_CODE_ANSI}WXYZ-1234" in rendered
 
 
 def test_orchestrator_success_proceeds_and_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENSRE_GITHUB_GATE_VARIANT", "control")
+    monkeypatch.setattr(flg, "_offer_github_login", lambda _console, **_kwargs: "sign_in")
     monkeypatch.setattr(
         github_login_mod,
         "authenticate_and_configure_github",
         lambda **_kwargs: GitHubLoginResult(ok=True, username="octocat", detail="OK"),
     )
-    completed: list[str] = []
-    monkeypatch.setattr(flg, "capture_github_login_completed", completed.append)
+    completed: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(
+        flg,
+        "capture_github_login_completed",
+        lambda username, *, variant=None: completed.append((username, variant)),
+    )
+    cleared: list[bool] = []
+    monkeypatch.setattr(flg, "clear_github_login_deferral", lambda: cleared.append(True))
+    monkeypatch.setattr(flg, "capture_github_login_prompted", lambda **_kwargs: None)
+    monkeypatch.setattr(flg, "stamp_github_gate_variant", lambda _variant: None)
 
     proceed = flg.require_github_login_on_first_launch(_console())
 
     assert proceed is True
-    assert completed == ["octocat"]
+    assert completed == [("octocat", "control")]
+    assert cleared == [True]
 
 
-def test_orchestrator_quit_does_not_proceed(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_orchestrator_success_without_username_skips_completed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Auth can succeed without a resolvable username; do not pollute completed."""
+    monkeypatch.setenv("OPENSRE_GITHUB_GATE_VARIANT", "control")
+    monkeypatch.setattr(flg, "_offer_github_login", lambda _console, **_kwargs: "sign_in")
+    monkeypatch.setattr(
+        github_login_mod,
+        "authenticate_and_configure_github",
+        lambda **_kwargs: GitHubLoginResult(ok=True, username="", detail="OK"),
+    )
+    completed: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(
+        flg,
+        "capture_github_login_completed",
+        lambda username, *, variant=None: completed.append((username, variant)),
+    )
+    monkeypatch.setattr(flg, "clear_github_login_deferral", lambda: None)
+    monkeypatch.setattr(flg, "capture_github_login_prompted", lambda **_kwargs: None)
+    monkeypatch.setattr(flg, "stamp_github_gate_variant", lambda _variant: None)
+
+    proceed = flg.require_github_login_on_first_launch(_console())
+
+    assert proceed is True
+    assert completed == []
+
+
+def test_orchestrator_skip_at_menu_proceeds_in_control(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENSRE_GITHUB_GATE_VARIANT", "control")
+    monkeypatch.setattr(flg, "_offer_github_login", lambda _console, **_kwargs: "skip_menu")
+    deferred: list[bool] = []
+    skipped: list[tuple[str, str]] = []
+    monkeypatch.setattr(flg, "write_github_login_deferred", deferred.append)
+    monkeypatch.setattr(
+        flg,
+        "capture_github_login_skipped",
+        lambda *, variant, skip_source: skipped.append((variant, skip_source)),
+    )
+    monkeypatch.setattr(flg, "capture_github_login_prompted", lambda **_kwargs: None)
+    monkeypatch.setattr(flg, "stamp_github_gate_variant", lambda _variant: None)
+
+    proceed = flg.require_github_login_on_first_launch(_console())
+
+    assert proceed is True
+    assert deferred == [True]
+    assert skipped == [("control", GITHUB_SKIP_SOURCE_MENU)]
+
+
+def test_orchestrator_escape_during_wait_proceeds_in_control(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSRE_GITHUB_GATE_VARIANT", "control")
+    monkeypatch.setattr(flg, "_offer_github_login", lambda _console, **_kwargs: "sign_in")
+
     def _raise_cancel(**_kwargs: object) -> GitHubLoginResult:
         raise KeyboardInterrupt
 
     monkeypatch.setattr(github_login_mod, "authenticate_and_configure_github", _raise_cancel)
+    deferred: list[bool] = []
+    skipped: list[tuple[str, str]] = []
+    monkeypatch.setattr(flg, "write_github_login_deferred", deferred.append)
+    monkeypatch.setattr(flg, "capture_github_login_prompted", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        flg,
+        "capture_github_login_skipped",
+        lambda *, variant, skip_source: skipped.append((variant, skip_source)),
+    )
+    monkeypatch.setattr(flg, "stamp_github_gate_variant", lambda _variant: None)
 
     proceed = flg.require_github_login_on_first_launch(_console())
 
-    assert proceed is False
+    assert proceed is True
+    assert deferred == [True]
+    assert skipped == [("control", GITHUB_SKIP_SOURCE_ESCAPE)]
 
 
-def test_orchestrator_failure_then_decline_retry_quits(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_orchestrator_failure_then_decline_retry_skips_in_control(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSRE_GITHUB_GATE_VARIANT", "control")
+    monkeypatch.setattr(flg, "_offer_github_login", lambda _console, **_kwargs: "sign_in")
     monkeypatch.setattr(
         github_login_mod,
         "authenticate_and_configure_github",
         lambda **_kwargs: GitHubLoginResult(ok=False, detail="cannot verify"),
     )
-    monkeypatch.setattr(flg, "_ask_retry", lambda _console: False)
+    monkeypatch.setattr(flg, "_ask_retry", lambda _console: "declined_retry")
+    deferred: list[bool] = []
+    skipped: list[tuple[str, str]] = []
+    failed: list[tuple[str, str]] = []
+    monkeypatch.setattr(flg, "write_github_login_deferred", deferred.append)
+    monkeypatch.setattr(flg, "capture_github_login_prompted", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        flg,
+        "capture_github_login_skipped",
+        lambda *, variant, skip_source: skipped.append((variant, skip_source)),
+    )
+    monkeypatch.setattr(
+        flg,
+        "capture_github_login_failed",
+        lambda *, variant, reason_category: failed.append((variant, reason_category)),
+    )
+    monkeypatch.setattr(flg, "stamp_github_gate_variant", lambda _variant: None)
+
+    proceed = flg.require_github_login_on_first_launch(_console())
+
+    assert proceed is True
+    assert deferred == [True]
+    assert failed == [("control", GITHUB_FAIL_VERIFY)]
+    assert skipped == [("control", GITHUB_SKIP_SOURCE_DECLINE_RETRY)]
+
+
+def test_orchestrator_forced_cancel_aborts_startup(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENSRE_GITHUB_GATE_VARIANT", "forced")
+
+    def _raise_cancel(**_kwargs: object) -> GitHubLoginResult:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(github_login_mod, "authenticate_and_configure_github", _raise_cancel)
+    abandoned: list[tuple[str, str]] = []
+    deferred: list[bool] = []
+    monkeypatch.setattr(flg, "write_github_login_deferred", deferred.append)
+    monkeypatch.setattr(
+        flg,
+        "capture_github_login_abandoned",
+        lambda *, variant, reason: abandoned.append((variant, reason)),
+    )
+    monkeypatch.setattr(flg, "capture_github_login_prompted", lambda **_kwargs: None)
+    monkeypatch.setattr(flg, "stamp_github_gate_variant", lambda _variant: None)
 
     proceed = flg.require_github_login_on_first_launch(_console())
 
     assert proceed is False
+    assert deferred == []
+    assert abandoned == [("forced", "cancelled")]
+
+
+def test_orchestrator_forced_decline_retry_aborts_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSRE_GITHUB_GATE_VARIANT", "forced")
+    monkeypatch.setattr(
+        github_login_mod,
+        "authenticate_and_configure_github",
+        lambda **_kwargs: GitHubLoginResult(ok=False, detail="cannot verify"),
+    )
+    monkeypatch.setattr(flg, "_ask_retry", lambda _console: "declined_retry")
+    abandoned: list[tuple[str, str]] = []
+    failed: list[tuple[str, str]] = []
+    deferred: list[bool] = []
+    monkeypatch.setattr(flg, "write_github_login_deferred", deferred.append)
+    monkeypatch.setattr(
+        flg,
+        "capture_github_login_abandoned",
+        lambda *, variant, reason: abandoned.append((variant, reason)),
+    )
+    monkeypatch.setattr(
+        flg,
+        "capture_github_login_failed",
+        lambda *, variant, reason_category: failed.append((variant, reason_category)),
+    )
+    monkeypatch.setattr(flg, "capture_github_login_prompted", lambda **_kwargs: None)
+    monkeypatch.setattr(flg, "stamp_github_gate_variant", lambda _variant: None)
+
+    proceed = flg.require_github_login_on_first_launch(_console())
+
+    assert proceed is False
+    assert deferred == []
+    assert failed == [("forced", GITHUB_FAIL_VERIFY)]
+    assert abandoned == [("forced", "declined_retry")]
+
+
+def test_orchestrator_forced_cancel_retry_aborts_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSRE_GITHUB_GATE_VARIANT", "forced")
+    monkeypatch.setattr(
+        github_login_mod,
+        "authenticate_and_configure_github",
+        lambda **_kwargs: GitHubLoginResult(ok=False, detail="cannot verify"),
+    )
+    monkeypatch.setattr(flg, "_ask_retry", lambda _console: "cancelled")
+    abandoned: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        flg,
+        "capture_github_login_abandoned",
+        lambda *, variant, reason: abandoned.append((variant, reason)),
+    )
+    monkeypatch.setattr(flg, "capture_github_login_failed", lambda **_kwargs: None)
+    monkeypatch.setattr(flg, "capture_github_login_prompted", lambda **_kwargs: None)
+    monkeypatch.setattr(flg, "stamp_github_gate_variant", lambda _variant: None)
+
+    proceed = flg.require_github_login_on_first_launch(_console())
+
+    assert proceed is False
+    assert abandoned == [("forced", "cancelled")]
+
+
+def test_orchestrator_forced_success_proceeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENSRE_GITHUB_GATE_VARIANT", "forced")
+    monkeypatch.setattr(
+        github_login_mod,
+        "authenticate_and_configure_github",
+        lambda **_kwargs: GitHubLoginResult(ok=True, username="octocat", detail="OK"),
+    )
+    completed: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(
+        flg,
+        "capture_github_login_completed",
+        lambda username, *, variant=None: completed.append((username, variant)),
+    )
+    monkeypatch.setattr(flg, "clear_github_login_deferral", lambda: None)
+    monkeypatch.setattr(flg, "capture_github_login_prompted", lambda **_kwargs: None)
+    monkeypatch.setattr(flg, "stamp_github_gate_variant", lambda _variant: None)
+
+    proceed = flg.require_github_login_on_first_launch(_console())
+
+    assert proceed is True
+    assert completed == [("octocat", "forced")]
 
 
 def test_orchestrator_retries_until_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENSRE_GITHUB_GATE_VARIANT", "control")
+    monkeypatch.setattr(flg, "_offer_github_login", lambda _console, **_kwargs: "sign_in")
     calls = {"n": 0}
 
     def _login(**_kwargs: object) -> GitHubLoginResult:
@@ -188,10 +411,156 @@ def test_orchestrator_retries_until_success(monkeypatch: pytest.MonkeyPatch) -> 
         return GitHubLoginResult(ok=True, username="octocat", detail="OK")
 
     monkeypatch.setattr(github_login_mod, "authenticate_and_configure_github", _login)
-    monkeypatch.setattr(flg, "_ask_retry", lambda _console: True)
-    monkeypatch.setattr(flg, "capture_github_login_completed", lambda _username: None)
+    monkeypatch.setattr(flg, "_ask_retry", lambda _console: "retry")
+    monkeypatch.setattr(flg, "capture_github_login_completed", lambda _username, **_kwargs: None)
+    monkeypatch.setattr(flg, "capture_github_login_failed", lambda **_kwargs: None)
+    monkeypatch.setattr(flg, "clear_github_login_deferral", lambda: None)
+    monkeypatch.setattr(flg, "capture_github_login_prompted", lambda **_kwargs: None)
+    monkeypatch.setattr(flg, "stamp_github_gate_variant", lambda _variant: None)
 
     proceed = flg.require_github_login_on_first_launch(_console())
 
     assert proceed is True
     assert calls["n"] == 2
+
+
+def test_gate_shown_before_ui_and_stamps_variant(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Variant is resolved/stamped and exposure fires before the menu/device UI."""
+    monkeypatch.setenv("OPENSRE_GITHUB_GATE_VARIANT", "forced")
+    order: list[str] = []
+
+    def _stamp(variant: str) -> None:
+        order.append(f"stamp:{variant}")
+
+    def _prompted(*, variant: str) -> None:
+        order.append(f"shown:{variant}")
+
+    def _offer(_console: object, **_kwargs: object) -> str:
+        order.append("offer")
+        return "sign_in"
+
+    monkeypatch.setattr(flg, "stamp_github_gate_variant", _stamp)
+    monkeypatch.setattr(flg, "capture_github_login_prompted", _prompted)
+    monkeypatch.setattr(flg, "_offer_github_login", _offer)
+    monkeypatch.setattr(
+        github_login_mod,
+        "authenticate_and_configure_github",
+        lambda **_kwargs: GitHubLoginResult(ok=True, username="octocat", detail="OK"),
+    )
+    monkeypatch.setattr(flg, "capture_github_login_completed", lambda *_a, **_k: None)
+    monkeypatch.setattr(flg, "clear_github_login_deferral", lambda: None)
+
+    assert flg.require_github_login_on_first_launch(_console()) is True
+    assert order[:3] == ["stamp:forced", "shown:forced", "offer"]
+
+
+def test_no_duplicate_terminal_outcome_on_menu_skip(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENSRE_GITHUB_GATE_VARIANT", "control")
+    monkeypatch.setattr(flg, "_offer_github_login", lambda _console, **_kwargs: "skip_menu")
+    outcomes: list[str] = []
+    monkeypatch.setattr(flg, "capture_github_login_prompted", lambda **_kwargs: None)
+    monkeypatch.setattr(flg, "stamp_github_gate_variant", lambda _variant: None)
+    monkeypatch.setattr(flg, "write_github_login_deferred", lambda _v: None)
+    monkeypatch.setattr(
+        flg,
+        "capture_github_login_skipped",
+        lambda **_kwargs: outcomes.append("skipped"),
+    )
+    monkeypatch.setattr(
+        flg,
+        "capture_github_login_completed",
+        lambda *_a, **_k: outcomes.append("completed"),
+    )
+    monkeypatch.setattr(
+        flg,
+        "capture_github_login_abandoned",
+        lambda **_kwargs: outcomes.append("abandoned"),
+    )
+
+    assert flg.require_github_login_on_first_launch(_console()) is True
+    assert outcomes == ["skipped"]
+
+
+def test_startup_bypass_does_not_emit_skip(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CI/test/env bypasses must not be counted as user skips."""
+    monkeypatch.setenv("OPENSRE_SKIP_GITHUB_LOGIN", "1")
+    skipped: list[object] = []
+    shown: list[object] = []
+    monkeypatch.setattr(flg, "capture_github_login_skipped", lambda **_k: skipped.append(True))
+    monkeypatch.setattr(flg, "capture_github_login_prompted", lambda **_k: shown.append(True))
+    monkeypatch.setattr(flg, "is_test_run", lambda: False)
+    monkeypatch.setattr(flg, "repl_tty_interactive", lambda: True)
+    monkeypatch.setattr(flg, "_github_already_configured", lambda: False)
+    monkeypatch.setattr(flg, "read_github_login_deferred", lambda: False)
+
+    assert flg.require_startup_github_login(_console()) is True
+    assert shown == []
+    assert skipped == []
+
+
+def test_orchestrator_offer_escape_skip_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENSRE_GITHUB_GATE_VARIANT", "control")
+    monkeypatch.setattr(flg, "_offer_github_login", lambda _console, **_kwargs: "skip_escape")
+    skipped: list[tuple[str, str]] = []
+    monkeypatch.setattr(flg, "write_github_login_deferred", lambda _v: None)
+    monkeypatch.setattr(flg, "capture_github_login_prompted", lambda **_kwargs: None)
+    monkeypatch.setattr(flg, "stamp_github_gate_variant", lambda _variant: None)
+    monkeypatch.setattr(
+        flg,
+        "capture_github_login_skipped",
+        lambda *, variant, skip_source: skipped.append((variant, skip_source)),
+    )
+
+    assert flg.require_github_login_on_first_launch(_console()) is True
+    assert skipped == [("control", GITHUB_SKIP_SOURCE_ESCAPE)]
+
+
+def test_clear_github_login_deferral_noop_when_not_deferred(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(flg, "read_github_login_deferred", lambda: False)
+    writes: list[bool] = []
+    monkeypatch.setattr(flg, "write_github_login_deferred", writes.append)
+
+    flg.clear_github_login_deferral()
+
+    assert writes == []
+
+
+def test_clear_github_login_deferral_clears_when_deferred(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(flg, "read_github_login_deferred", lambda: True)
+    writes: list[bool] = []
+    monkeypatch.setattr(flg, "write_github_login_deferred", writes.append)
+
+    flg.clear_github_login_deferral()
+
+    assert writes == [False]
+
+
+def test_sleep_until_or_cancel_raises_on_escape(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(flg.os, "name", "posix")
+    monkeypatch.setattr(flg.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(flg.sys.stdin, "fileno", lambda: 0)
+    monkeypatch.setattr(
+        "surfaces.interactive_shell.ui.components.key_reader.read_key_unix",
+        lambda **_kwargs: "cancel",
+    )
+    monkeypatch.setattr("termios.tcgetattr", lambda _fd: [0] * 7)
+    monkeypatch.setattr("tty.setraw", lambda _fd: None)
+    restored: list[bool] = []
+    monkeypatch.setattr(
+        "termios.tcsetattr",
+        lambda _fd, _when, _attrs: restored.append(True),
+    )
+
+    def _ready(
+        _fd: int, *_args: object, **_kwargs: object
+    ) -> tuple[list[int], list[int], list[int]]:
+        return ([0], [], [])
+
+    monkeypatch.setattr("select.select", _ready)
+
+    with pytest.raises(KeyboardInterrupt):
+        flg._sleep_until_or_cancel(1.0)
+
+    assert restored == [True]

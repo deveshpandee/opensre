@@ -16,7 +16,8 @@ import httpx
 from pydantic import Field, field_validator
 
 from config.strict_config import StrictConfigModel
-from integrations._validation_helpers import report_validation_failure
+from core.tool_framework.utils.tool_availability import tool_unavailable
+from integrations._validation_helpers import report_classify_failure, report_validation_failure
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +135,7 @@ def list_commits(
     Read-only: uses the commits endpoint.
     """
     if not config.is_configured:
-        return {"source": "bitbucket", "available": False, "error": "Not configured."}
+        return tool_unavailable("bitbucket", "Not configured.")
 
     effective_limit = min(limit or config.max_results, config.max_results)
     try:
@@ -173,7 +174,7 @@ def list_commits(
             integration="bitbucket",
             method="list_commits",
         )
-        return {"source": "bitbucket", "available": False, "error": str(err)}
+        return tool_unavailable("bitbucket", str(err))
 
 
 def get_file_contents(
@@ -187,7 +188,7 @@ def get_file_contents(
     Read-only: uses the src endpoint.
     """
     if not config.is_configured:
-        return {"source": "bitbucket", "available": False, "error": "Not configured."}
+        return tool_unavailable("bitbucket", "Not configured.")
 
     try:
         client = _get_client(config)
@@ -215,7 +216,7 @@ def get_file_contents(
             integration="bitbucket",
             method="get_file_contents",
         )
-        return {"source": "bitbucket", "available": False, "error": str(err)}
+        return tool_unavailable("bitbucket", str(err))
 
 
 def search_code(
@@ -229,7 +230,7 @@ def search_code(
     Read-only: uses the code search endpoint.
     """
     if not config.is_configured:
-        return {"source": "bitbucket", "available": False, "error": "Not configured."}
+        return tool_unavailable("bitbucket", "Not configured.")
 
     effective_limit = min(limit or config.max_results, config.max_results)
     try:
@@ -271,7 +272,7 @@ def search_code(
             integration="bitbucket",
             method="search_code",
         )
-        return {"source": "bitbucket", "available": False, "error": str(err)}
+        return tool_unavailable("bitbucket", str(err))
 
 
 def classify(
@@ -288,7 +289,8 @@ def classify(
                 "integration_id": record_id,
             }
         )
-    except Exception:
+    except Exception as exc:
+        report_classify_failure(exc, logger=logger, integration="bitbucket", record_id=record_id)
         return None, None
     if cfg.workspace:
         return cfg, "bitbucket"

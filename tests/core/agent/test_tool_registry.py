@@ -6,7 +6,6 @@ import re
 
 from rich.console import Console
 
-from core.agent_harness.session import Session
 from core.agent_harness.tools.action_tools import (
     get_action_tool,
     get_action_tools_from_integrations_context,
@@ -16,6 +15,7 @@ from core.agent_harness.tools.tool_context import (
 )
 from surfaces.cli.wizard.config import PROVIDER_BY_VALUE
 from surfaces.interactive_shell.command_registry import SLASH_COMMANDS
+from surfaces.interactive_shell.session import Session
 from tools.interactive_shell.action_names import TOOL_KIND_TO_NAME
 
 
@@ -142,6 +142,8 @@ def test_tools_hidden_when_capabilities_are_explicitly_empty() -> None:
             "shell_commands": (),
             "implementation": (),
             "llm_provider": (),
+            "investigation": (),
+            "task_cancel": (),
         }
     )
     names = {spec["name"] for spec in _tool_specs(session)}
@@ -151,13 +153,15 @@ def test_tools_hidden_when_capabilities_are_explicitly_empty() -> None:
     assert "shell_run" not in names
     assert "code_implement" not in names
     assert "llm_set_provider" not in names
+    assert "investigation_start" not in names
+    assert "alert_sample" not in names
+    assert "task_cancel" not in names
 
 
 def test_telegram_send_message_offered_when_telegram_is_configured() -> None:
-    session = Session(
-        configured_integrations=("telegram",),
-        configured_integrations_known=True,
-    )
+    session = Session()
+    session.configured_integrations = ("telegram",)
+    session.configured_integrations_known = True
     names = {
         spec["name"]
         for spec in _tool_specs(
@@ -171,6 +175,31 @@ def test_telegram_send_message_offered_when_telegram_is_configured() -> None:
 def test_telegram_send_message_hidden_when_telegram_is_not_configured() -> None:
     names = {spec["name"] for spec in _tool_specs(Session())}
     assert "telegram_send_message" not in names
+
+
+def test_rocketchat_send_message_offered_when_rocketchat_is_configured() -> None:
+    session = Session()
+    session.configured_integrations = ("rocketchat",)
+    session.configured_integrations_known = True
+    names = {
+        spec["name"]
+        for spec in _tool_specs(
+            session,
+            resolved_integrations={
+                "rocketchat": {
+                    "server_url": "https://chat.example.com",
+                    "auth_token": "token",
+                    "user_id": "u1",
+                }
+            },
+        )
+    }
+    assert "rocketchat_send_message" in names
+
+
+def test_rocketchat_send_message_hidden_when_rocketchat_is_not_configured() -> None:
+    names = {spec["name"] for spec in _tool_specs(Session())}
+    assert "rocketchat_send_message" not in names
 
 
 def test_llm_set_provider_offered_by_default() -> None:
@@ -228,3 +257,21 @@ def test_synthetic_tool_description_preserves_numeric_id_guidance() -> None:
     assert '"005" -> "005-failover"' in description
     assert '"004" -> "004-cpu-saturation-bad-query"' in description
     assert "never substitute a neighboring numbered scenario" in description
+
+
+def test_gateway_capabilities_only_hide_gateway_unsupported_tools() -> None:
+    session = Session(
+        available_capabilities={
+            "investigation": (),
+            "llm_provider": (),
+            "task_cancel": (),
+        }
+    )
+
+    names = {spec["name"] for spec in _tool_specs(session)}
+
+    assert "investigation_start" not in names
+    assert "alert_sample" not in names
+    assert "llm_set_provider" not in names
+    assert "task_cancel" not in names
+    assert "slash_invoke" in names

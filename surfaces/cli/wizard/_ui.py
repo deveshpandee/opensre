@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import cast
@@ -19,10 +20,11 @@ from config.llm_auth.auth_method import (
 )
 from config.llm_auth.credentials import has_llm_api_key, save_api_key
 from config.llm_auth.provider_catalog import API_KEY_PROVIDER_ENVS
-from config.llm_credentials import get_keyring_setup_instructions, save_llm_api_key
-from config.version import get_version
+from config.llm_credentials import get_keyring_setup_instructions, save_keyring_secret
+from config.version import get_opensre_version
 from integrations.store import get_integration
 from platform.terminal.theme import (
+    BG,
     BRAND,
     DIM,
     ERROR,
@@ -34,7 +36,7 @@ from platform.terminal.theme import (
     TEXT,
     WARNING,
 )
-from surfaces.cli.llm_auth.service import AuthSetupError, persist_api_key_secret
+from surfaces.cli.llm_auth.persist import AuthSetupError, persist_api_key_secret
 from surfaces.cli.wizard.config import PROVIDER_BY_VALUE, ProviderOption
 from surfaces.cli.wizard.integration_health import IntegrationHealthResult
 from surfaces.cli.wizard.probes import ProbeResult
@@ -45,21 +47,29 @@ _console = Console(
     highlight=False, force_terminal=True, color_system="truecolor", legacy_windows=False
 )
 
-_STYLE = questionary.Style(
-    [
-        ("qmark", f"fg:{HIGHLIGHT} bold"),
-        ("question", f"fg:{TEXT} bold"),
-        ("answer", f"fg:{BRAND} bold"),
-        ("pointer", f"fg:{HIGHLIGHT} bold"),
-        ("highlighted", f"fg:{TEXT} bg:{HIGHLIGHT} bold"),
-        ("selected", f"fg:{TEXT} bg:default bold"),
-        ("group-header", f"fg:{HIGHLIGHT} bold"),
-        ("separator", f"fg:{DIM}"),
-        ("text", f"fg:{TEXT} bg:default"),
-        ("disabled", f"fg:{SECONDARY} bg:default italic"),
-        ("instruction", f"fg:{SECONDARY} italic"),
-    ]
-)
+
+def _questionary_style() -> questionary.Style:
+    """Build questionary styles from the active terminal theme.
+
+    Highlighted list rows use ``BG`` (dark) on ``HIGHLIGHT`` (light accent) so
+    selected options stay readable across every palette — light ``TEXT`` on a
+    light ``HIGHLIGHT`` background was nearly invisible in green and similar themes.
+    """
+    return questionary.Style(
+        [
+            ("qmark", f"fg:{HIGHLIGHT} bold"),
+            ("question", f"fg:{TEXT} bold"),
+            ("answer", f"fg:{BRAND} bold"),
+            ("pointer", f"fg:{HIGHLIGHT} bold"),
+            ("highlighted", f"fg:{BG} bg:{HIGHLIGHT} bold"),
+            ("selected", f"fg:{TEXT} bg:default bold"),
+            ("group-header", f"fg:{HIGHLIGHT} bold"),
+            ("separator", f"fg:{DIM}"),
+            ("text", f"fg:{TEXT} bg:default"),
+            ("disabled", f"fg:{SECONDARY} bg:default italic"),
+            ("instruction", f"fg:{SECONDARY} italic"),
+        ]
+    )
 
 
 def _group_header_label(group: str) -> str:
@@ -112,6 +122,7 @@ def _local_defaults() -> dict[str, str | bool | None]:
         local.get("api_key_env"), api_key_provider.api_key_env if api_key_provider else ""
     )
     is_cli = bool(raw_provider_option and raw_provider_option.credential_kind == "cli")
+    is_host = bool(api_key_provider and api_key_provider.credential_kind == "host")
     is_oauth_backend = bool(raw_provider_value and raw_provider_value != provider_value)
     raw_auth_method = local.get("auth_method")
     auth_method = (
@@ -127,7 +138,15 @@ def _local_defaults() -> dict[str, str | bool | None]:
         "auth_method": auth_method,
         "model": _string_value(local.get("model")),
         "api_key_env": api_key_env,
-        "has_api_key": True if is_cli else bool(api_key_env and has_llm_api_key(api_key_env)),
+        # A ``host`` credential (e.g. the Ollama host) is only real when the
+        # runtime can see it — the environment — never the keyring.
+        "has_api_key": True
+        if is_cli
+        else (
+            bool(api_key_env and os.getenv(api_key_env, "").strip())
+            if is_host
+            else bool(api_key_env and has_llm_api_key(api_key_env))
+        ),
         "legacy_api_key": _string_value(local.get("api_key")),
     }
 
@@ -240,7 +259,7 @@ def _choose_model(
 ) -> str:
     """Prompt the user to pick a model from ``provider.models``.
 
-    Choices come from the curated config in ``cli/wizard/config.py``.
+    Choices come from the curated config in ``surfaces/cli/wizard/config.py``.
     A saved model that isn't in the curated list is preserved as ``current``
     so re-running the wizard never silently drops a user's prior pick, and an
     "Enter custom model ID" escape hatch is always available.
@@ -316,7 +335,7 @@ def _choose(
         prompt,
         choices=q_choices,
         default=default,
-        style=_STYLE,
+        style=_questionary_style(),
         instruction="(Use arrows to move, Enter to choose)",
     ).ask()
 
@@ -328,7 +347,7 @@ def _choose(
 
 
 def _confirm(prompt: str, *, default: bool = True) -> bool:
-    result = questionary.confirm(prompt, default=default, style=_STYLE).ask()
+    result = questionary.confirm(prompt, default=default, style=_questionary_style()).ask()
     if result is None:
         raise KeyboardInterrupt
     return bool(result)
@@ -348,14 +367,14 @@ def _prompt_value(
             result = questionary.password(
                 label,
                 default=default,
-                style=_STYLE,
+                style=_questionary_style(),
                 instruction=instruction,
             ).ask()
         else:
             result = questionary.text(
                 label,
                 default=default,
-                style=_STYLE,
+                style=_questionary_style(),
                 instruction=instruction,
             ).ask()
 
@@ -387,7 +406,7 @@ def _persist_llm_api_key(env_var: str, value: str) -> bool:
         if provider:
             save_api_key(provider, value)
         else:
-            persist_api_key_secret(env_var, value, save_secret=save_llm_api_key)
+            persist_api_key_secret(env_var, value, save_secret=save_keyring_secret)
     except (AuthSetupError, RuntimeError, ValueError) as exc:
         _console.print(f"[{ERROR}]  {GLYPH_ERROR}  {exc}[/]")
         _console.print(
@@ -439,14 +458,14 @@ def _render_header() -> None:
         ___                    ____  ____  _____ [HIGHLIGHT art]
        / _ \\ ...
       opensre  ·  v<version>                     [SECONDARY name] [DIM ·] [BRAND version]
-      open-source SRE agent for automated …      [DIM description]
+      open-source SRE agent for automated …      [SECONDARY description]
       ─────────────────────────────────────────  [DIM rule]
       Setup — Configure your local AI stack …    [SECONDARY subtitle]
     """
     from surfaces.interactive_shell.ui.components.banner_art import _render_art
 
     art = _render_art()
-    version = get_version()
+    version = get_opensre_version()
 
     _console.print()
     _console.print(Rule(style=DIM))
@@ -470,7 +489,7 @@ def _render_header() -> None:
     desc = Text()
     desc.append(
         "  open-source SRE agent for automated incident investigation and root cause analysis",
-        style=DIM,
+        style=SECONDARY,
     )
     _console.print(desc)
     _console.print()

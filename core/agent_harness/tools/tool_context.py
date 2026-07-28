@@ -29,6 +29,12 @@ class ActionToolContext:
     # summary. The action-agent dispatcher passes True because it has already
     # rendered the planned action list.
     action_already_listed: bool = False
+    # Surface-injected subprocess presenter (``tools.interactive_shell.subprocess``).
+    subprocess_presenter: Any = None
+    investigation_ports: Any = None
+    llm_provider_ports: Any = None
+    task_cancel_ports: Any = None
+    slash_ports: Any = None
 
 
 def action_context_from_agent_context(context: AgentToolContext) -> ActionToolContext:

@@ -13,8 +13,6 @@ Examples of files that qualify:
 - `CI.md`
 - `CONTRIBUTING.md`
 - `README.md`
-- `TESTING.md`
-- `TOOL_INTEGRATION_CHECKLIST.md`
 - `docs/**/*.md`
 - `docs/**/*.mdx`
 - `docs/docs.json`
@@ -95,7 +93,7 @@ Rules with `always_escalate=True` map to `make test-cov`; all others list their
 
 Run `make test-cov` (instead of only targeted tests) when any of these are true:
 
-- Shared/core code changed (`core/context/state/`, `core/domain/types/`, `tools/investigation/`, `tools/investigation/stages/`)
+- Shared/core code changed (`core/state/`, `core/domain/types/`, `tools/investigation/`, `tools/investigation/stages/`)
 - 3+ app areas changed in one diff
 - New files with unclear blast radius
 - Cross-cutting refactor
@@ -107,7 +105,13 @@ make test-cov
 
 ## 4) Conditional checks
 
-If integration config, integration wiring, or related tools changed, also run:
+CI runs the fast registry smoke gate on every code change:
+
+```bash
+make verify-integrations-smoke
+```
+
+If integration config, integration wiring, or related tools changed, also run the live check against your local store and environment:
 
 ```bash
 make verify-integrations

@@ -1,9 +1,9 @@
-"""Splash screen, agent ready-state box, and REPL launch banner.
+"""Splash screen and agent ready-state box for the REPL launch banner.
 
-Three exported entry points
----------------------------
+Two exported entry points
+-------------------------
 render_splash(console, first_run=False)
-    Full branded startup screen with ASCII art and optional security gate.
+    Branded startup screen with the Braille logomark and optional security gate.
     Called once when the CLI starts.
 
 render_ready_box(console, session=None)
@@ -12,15 +12,11 @@ render_ready_box(console, session=None)
       right → "Tips for getting started" + "What's new"
     Called after the splash and on /clear, /welcome, and greeting aliases.
 
-render_banner(console)
-    Backward-compatible shim: render_splash + render_ready_box in one call.
-    Existing callers continue to work unchanged.
-
 Rendered output legend (colour roles)
 --------------------------------------
-# [HIGHLIGHT]  ASCII art lines · ◉ glyph · OpenSRE brand name
+# [HIGHLIGHT]  ◉ glyph · OpenSRE brand name
 # [BRAND]      version string · model name · section headers
-# [SECONDARY]  "opensre" product name label · cwd · tip / note body
+# [SECONDARY]  Braille logomark · "opensre" product name label · cwd · tip / note body
 # [DIM]        subtitle description · rule lines · box chrome · dividers
 # [TEXT]       provider/model values · greeting
 # [WARNING]    read-only or trust-mode notice · incomplete-integration marker
@@ -41,7 +37,7 @@ from rich.table import Table
 from rich.text import Text
 
 from config.repl_config import WHATS_NEW
-from config.version import get_version
+from config.version import get_opensre_version
 from platform.terminal.theme import (
     BRAND,
     DIM,
@@ -51,7 +47,7 @@ from platform.terminal.theme import (
     WARNING,
 )
 from surfaces.interactive_shell.ui.banner.banner_state import _build_ambient_right_column
-from surfaces.interactive_shell.ui.components.banner_art import _render_art
+from surfaces.interactive_shell.ui.banner.splash_layout import build_splash_layout
 from surfaces.interactive_shell.ui.tables.provider import detect_provider_model
 
 
@@ -71,14 +67,14 @@ def _is_first_run() -> bool:
 def render_splash(console: Console | None = None, *, first_run: bool | None = None) -> None:
     """Print the branded startup splash.
 
-    Rendered output (with colour roles):
+    Responsive layout (see splash_layout.select_splash_mode):
+    ≥ 90 cols — large Braille logo beside the splash content:
     ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄ [DIM divider]
-    ╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋           [HIGHLIGHT art]
-    ...
-      opensre  [SECONDARY]  ·  v<version> [BRAND]
-      open-source SRE agent for automated incident
-      investigation and root cause analysis          [DIM]
+      ⣠⣶⡿…⢶⣄     opensre  ·  v<version>          [SECONDARY logo · BRAND]
+      …            open-source SRE agent …          [DIM]
     ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄ [DIM divider]
+    60–89 cols — small Braille logo beside the same condensed content.
+    < 60 cols — stacked subtitle + description only, no logo.
 
     If first_run (or not set and wizard has never run):
       ⚠  This tool runs AI-powered commands …      [WARNING]
@@ -93,35 +89,12 @@ def render_splash(console: Console | None = None, *, first_run: bool | None = No
     if first_run is None:
         first_run = _is_first_run()
 
-    version = get_version()
-    art = _render_art(console.width)
+    version = get_opensre_version()
 
     console.print()
     console.print(Rule(style=DIM))
     console.print()
-
-    for line in art.splitlines():
-        t = Text()
-        t.append("  ")
-        for ch in line:
-            t.append(ch, style=f"bold {HIGHLIGHT}" if ch == "█" else f"bold {BRAND}")
-        console.print(t)
-
-    console.print()
-
-    subtitle = Text()
-    subtitle.append("  ")
-    subtitle.append("opensre", style=SECONDARY)
-    subtitle.append("  ·  ", style=DIM)
-    subtitle.append(f"v{version}", style=BRAND)
-    console.print(subtitle)
-
-    desc = Text()
-    desc.append(
-        "  open-source SRE agent for automated incident investigation and root cause analysis",
-        style=DIM,
-    )
-    console.print(desc)
+    console.print(build_splash_layout(console.width, version))
     console.print()
     console.print(Rule(style=DIM))
 
@@ -291,7 +264,7 @@ def build_ready_panel(
         legacy_windows=False,
     )
     provider, model = detect_provider_model()
-    version = get_version()
+    version = get_opensre_version()
     trust_mode: bool = bool(getattr(session, "trust_mode", False))
 
     panel_title = Text()
@@ -359,21 +332,3 @@ def render_ready_box(
     console.print()
     console.print(build_ready_panel(console, session=session))
     console.print()
-
-
-# ── Backward-compatible shim ──────────────────────────────────────────────────
-
-
-def render_banner(console: Console | None = None) -> None:
-    """Render splash + ready-state box in one call (legacy entry point).
-
-    Existing callers (main.repl_main) continue to work unchanged.
-    """
-    _console = console or Console(
-        highlight=False,
-        force_terminal=True,
-        color_system="truecolor",
-        legacy_windows=False,
-    )
-    render_splash(_console)
-    render_ready_box(_console)

@@ -7,26 +7,31 @@ from typing import Any, cast
 
 from config.constants.investigation import MAX_INVESTIGATION_LOOPS
 from core import (
-    LoopEventCallback,
     RuntimeEventCallback,
+    TupleEventCallback,
     context_budget_ceiling_for_model,
     enforce_context_budget,
     estimate_message_tokens,
     execute_tools,
     summarise,
+    system_and_tools_overhead,
     tool_source,
 )
-from core.agent import Agent
-from core.context.state import InvestigationState
-from core.context.state.evidence import EvidenceEntry
-from core.llm.agent_llm_client import get_agent_llm
+from core.agent.mixins import EventEmitterMixin, ToolFilterMixin
+from core.llm.factory import LLMRole, get_llm
 from core.llm.types import ToolCall
 from core.llm_invoke_errors import classify_llm_invoke_failure
-from core.messages import MessageFormatter
-from core.tool_framework.registered_tool import RegisteredTool
+from core.messages import MessageMapper
+from core.state import InvestigationState
+from core.state.evidence import EvidenceEntry
 from platform.observability import debug_print
 from platform.observability import get_progress_tracker as get_tracker
-from platform.observability.tool_trace import redact_sensitive
+from platform.observability.trace.redaction import redact_sensitive
+from tools.investigation.stages.gather_evidence.incident_command import (
+    CONCLUSION_FORMAT_NUDGE,
+    POST_TRIAGE_CHECKPOINT,
+    incident_command_conclusion_complete,
+)
 from tools.investigation.stages.gather_evidence.loop import (
     InvestigationToolCallCache,
     degraded_investigation_from_llm_failure,
@@ -56,20 +61,15 @@ def _mark_messages(messages: list[dict[str, Any]], key: str) -> None:
         msg[key] = True
 
 
-class ConnectedInvestigationAgent(Agent[RegisteredTool]):
+class ConnectedInvestigationAgent(EventEmitterMixin, ToolFilterMixin):
     """ReAct loop scoped to the tools enabled by connected integrations.
 
-    Extends :class:`~core.agent.Agent` to reuse the shared event-emission and
-    tool-filtering infrastructure. The investigation loop is more specialised
-    than the generic :meth:`Agent.run` (seed calls, evidence collection,
-    duplicate detection, stagnation handling), so it overrides ``run()``
-    entirely — config plumbing (LLM, tools, prompt, resolved integrations) is
-    assembled inline in ``run()`` from ``state`` rather than through subclass
-    init hooks.
+    Owns a specialised investigation ``run()`` — seed calls, evidence collection,
+    duplicate detection, and stagnation handling — assembling its config (LLM,
+    tools, prompt, resolved integrations) inline from ``state``. Uses two agent
+    hooks: :class:`~core.agent.mixins.EventEmitterMixin` for event dispatch and
+    :class:`~core.agent.mixins.ToolFilterMixin` for tool narrowing.
     """
-
-    def __init__(self) -> None:
-        super().__init__(max_iterations=MAX_INVESTIGATION_LOOPS)
 
     def _should_accept_conclusion(
         self,
@@ -79,9 +79,20 @@ class ConnectedInvestigationAgent(Agent[RegisteredTool]):
     ) -> tuple[bool, str | None]:
         """Decide what to do when the LLM stops requesting tools.
 
+        Reject once when the final text omits required incident-command markers,
+        so the model reformats before diagnose parses the conclusion.
+
         Override in subclasses (e.g. :class:`CLIBackedInvestigationAgent`) to
         nudge the model back into tool calls before accepting a conclusion.
         """
+        last_text = getattr(self, "_last_assistant_text", "") or ""
+        if (
+            last_text.strip()
+            and not incident_command_conclusion_complete(last_text)
+            and not getattr(self, "_conclusion_format_nudged", False)
+        ):
+            self._conclusion_format_nudged = True
+            return False, CONCLUSION_FORMAT_NUDGE
         return True, None
 
     def _build_system_prompt(self, state: dict[str, Any]) -> str:
@@ -105,10 +116,10 @@ class ConnectedInvestigationAgent(Agent[RegisteredTool]):
         )
         self._emit("tool_end", tool_event_payload(tc, output=output))
 
-    def run(  # type: ignore[override]
+    def run(
         self,
         state: InvestigationState,
-        on_event: LoopEventCallback | None = None,
+        on_event: TupleEventCallback | None = None,
         on_runtime_event: RuntimeEventCallback | None = None,
     ) -> dict[str, Any]:
         """Run the full investigation. Returns a dict of state updates."""
@@ -122,12 +133,13 @@ class ConnectedInvestigationAgent(Agent[RegisteredTool]):
         available_tools = list(self._filter_tools(get_available_tools(resolved)))
         tools = list(select_investigation_tools(available_tools, state_dict))
         tool_context = build_connected_tool_context(resolved, tools)
+        tool_by_name = {tool.name: tool for tool in tools}
 
         if not tools:
             logger.warning("No tools available for investigation")
 
-        llm = get_agent_llm()
-        msg_formatter = MessageFormatter(llm)
+        llm = get_llm(LLMRole.AGENT)
+        msg_mapper = MessageMapper(llm)
         tool_schemas = llm.tool_schemas(tools)
 
         prompt_state = {**state_dict, **tool_context}
@@ -170,9 +182,9 @@ class ConnectedInvestigationAgent(Agent[RegisteredTool]):
                 }
             )
             seed_results = execute_tools(seed_calls, tools, resolved)
-            seed_msgs = msg_formatter.tool_results_from_execution(seed_calls, seed_results)
+            seed_msgs = msg_mapper.to_tool_result_provider_messages(seed_calls, seed_results)
 
-            seed_assistant_msg = msg_formatter.synthetic_assistant_tool_call(seed_calls)
+            seed_assistant_msg = msg_mapper.to_synthetic_assistant_provider_message(seed_calls)
             _mark_messages([seed_assistant_msg, *seed_msgs], "_opensre_seed")
             messages.append(seed_assistant_msg)
             messages.extend(seed_msgs)
@@ -186,7 +198,7 @@ class ConnectedInvestigationAgent(Agent[RegisteredTool]):
                         data=redact_sensitive(output),
                         tool_name=tc.name,
                         tool_args=redact_sensitive(tc.input),
-                        source=tool_source(tools, tc.name),
+                        source=tool_source(tool_by_name, tc.name),
                         loop_iteration=-1,
                     )
                 )
@@ -208,14 +220,21 @@ class ConnectedInvestigationAgent(Agent[RegisteredTool]):
         self._current_evidence: dict[str, Any] = evidence
 
         context_ceiling = context_budget_ceiling_for_model(getattr(llm, "_model", None))
+        full_overhead = system_and_tools_overhead(system, tool_schemas)
+        system_only_overhead = system_and_tools_overhead(system, None)
         stagnant_iterations = 0
         force_conclusion = False
+        self._last_assistant_text = ""
+        self._conclusion_format_nudged = False
+        self._post_triage_checkpoint_sent = False
+        loops_completed = 0
         for iteration in range(MAX_INVESTIGATION_LOOPS):
             logger.debug("[agent] iteration=%d", iteration)
             self._emit("llm_start", {"iteration": iteration})
             active_tool_schemas: list[dict[str, Any]] = [] if force_conclusion else tool_schemas
+            active_overhead = system_only_overhead if force_conclusion else full_overhead
             enforce_context_budget(
-                messages, system=system, tools=active_tool_schemas, ceiling=context_ceiling
+                messages, fixed_overhead_tokens=active_overhead, ceiling=context_ceiling
             )
             try:
                 response = llm.invoke(messages, system=system, tools=active_tool_schemas)
@@ -234,9 +253,13 @@ class ConnectedInvestigationAgent(Agent[RegisteredTool]):
                     messages=messages,
                     executed_hypotheses=executed_hypotheses,
                     tool_context=tool_context,
+                    investigation_loop_count=loops_completed,
                 )
 
-            messages.append(msg_formatter.assistant_from_response(response))
+            loops_completed = iteration + 1
+
+            messages.append(msg_mapper.to_assistant_provider_message(response))
+            self._last_assistant_text = str(getattr(response, "content", "") or "")
 
             if not response.has_tool_calls:
                 accept, nudge = self._should_accept_conclusion(
@@ -286,7 +309,7 @@ class ConnectedInvestigationAgent(Agent[RegisteredTool]):
                 tool_call_cache.store(tool_call_signature(tc), output, loop_iteration=iteration)
                 results.append(output)
 
-            tool_result_messages = msg_formatter.tool_results_from_execution(
+            tool_result_messages = msg_mapper.to_tool_result_provider_messages(
                 response.tool_calls, results
             )
             if duplicate_flags and all(duplicate_flags):
@@ -304,12 +327,16 @@ class ConnectedInvestigationAgent(Agent[RegisteredTool]):
                         data=redact_sensitive(output),
                         tool_name=tc.name,
                         tool_args=redact_sensitive(tc.input),
-                        source=tool_source(tools, tc.name),
+                        source=tool_source(tool_by_name, tc.name),
                         loop_iteration=iteration,
                     )
                 )
                 self._record_tool_end(tc, output)
                 debug_print(f"[{tc.name}] → {summarise(output)}")
+
+            if iteration == 0 and fresh_calls and not self._post_triage_checkpoint_sent:
+                messages.append({"role": "user", "content": POST_TRIAGE_CHECKPOINT})
+                self._post_triage_checkpoint_sent = True
 
             if fresh_calls:
                 stagnant_iterations = 0
@@ -341,6 +368,8 @@ class ConnectedInvestigationAgent(Agent[RegisteredTool]):
             {
                 "evidence_count": len(evidence_entries),
                 "message_count": len(messages),
+                "investigation_loop_count": loops_completed,
+                "investigation_iteration_cap": MAX_INVESTIGATION_LOOPS,
             },
         )
 
@@ -355,6 +384,8 @@ class ConnectedInvestigationAgent(Agent[RegisteredTool]):
             "evidence_entries": [e.model_dump() for e in evidence_entries],
             "agent_messages": messages,
             "executed_hypotheses": executed_hypotheses,
+            "investigation_loop_count": loops_completed,
+            "investigation_iteration_cap": MAX_INVESTIGATION_LOOPS,
         }
         updates.update(tool_context)
         return updates
@@ -369,9 +400,9 @@ def get_investigation_agent_class() -> type[ConnectedInvestigationAgent]:
     Callers that need a fixed class (e.g. bench harness, integration tests) should
     pass an explicit ``agent_class`` to the pipeline rather than calling this.
     """
-    from core.llm.sdk.agent_clients import CLIBackedAgentClient
+    from core.llm.transports.sdk.agent_clients import CLIBackedAgentClient
 
-    if isinstance(get_agent_llm(), CLIBackedAgentClient):
+    if isinstance(get_llm(LLMRole.AGENT), CLIBackedAgentClient):
         return CLIBackedInvestigationAgent
     return ConnectedInvestigationAgent
 
@@ -399,15 +430,24 @@ class CLIBackedInvestigationAgent(ConnectedInvestigationAgent):
         evidence = getattr(self, "_current_evidence", None)
 
         if not planned or evidence is None:
-            return True, None
+            return super()._should_accept_conclusion(
+                evidence_count=evidence_count,
+                iteration=iteration,
+            )
 
         # Leave room for a final text-only iteration after the nudge fires.
         if iteration >= MAX_INVESTIGATION_LOOPS - 2:
-            return True, None
+            return super()._should_accept_conclusion(
+                evidence_count=evidence_count,
+                iteration=iteration,
+            )
 
         uncalled = [name for name in planned if name not in evidence]
         if not uncalled:
-            return True, None
+            return super()._should_accept_conclusion(
+                evidence_count=evidence_count,
+                iteration=iteration,
+            )
 
         tool_list = ", ".join(uncalled)
         return False, (

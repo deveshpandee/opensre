@@ -1,9 +1,22 @@
 from __future__ import annotations
 
 import logging
+import os
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def clean_slack_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Remove SLACK_* env vars so the Slack verifier's Socket Mode branch only
+    activates when a test configures tokens explicitly."""
+    for key in list(os.environ):
+        if key.startswith("SLACK_"):
+            monkeypatch.delenv(key, raising=False)
+    yield
+
 
 from integrations.aws.verifier import verify_aws as _verify_aws
 from integrations.coralogix.verifier import verify_coralogix as _verify_coralogix
@@ -78,6 +91,31 @@ def test_resolve_effective_integrations_includes_honeycomb_and_coralogix_env(
 
     assert effective["honeycomb"]["config"]["dataset"] == "prod-api"
     assert effective["coralogix"]["config"]["application_name"] == "payments"
+
+
+def test_resolve_effective_integrations_includes_posthog_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("integrations.catalog.load_integrations", lambda: [])
+    monkeypatch.setenv("POSTHOG_PROJECT_ID", "123")
+    monkeypatch.setenv("POSTHOG_PERSONAL_API_KEY", "phx_test")
+
+    effective = resolve_effective_integrations()
+
+    assert effective["posthog"]["config"]["project_id"] == "123"
+    assert effective["posthog"]["config"]["personal_api_key"] == "phx_test"
+
+
+def test_resolve_effective_integrations_skips_posthog_without_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("integrations.catalog.load_integrations", lambda: [])
+    monkeypatch.delenv("POSTHOG_PROJECT_ID", raising=False)
+    monkeypatch.delenv("POSTHOG_PERSONAL_API_KEY", raising=False)
+
+    effective = resolve_effective_integrations()
+
+    assert "posthog" not in effective
 
 
 def test_resolve_effective_integrations_skips_snowflake_without_token(
@@ -190,6 +228,24 @@ def test_verify_telegram_api_not_ok(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "unauthorized" in result["detail"].lower()
 
 
+def test_verify_telegram_exception_redacts_bot_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """requests embeds the getMe URL — which carries the bot token — in
+    HTTPError messages; the verifier must redact it before surfacing the
+    detail (CWE-209)."""
+    token = "123456:SECRET-TOKEN-ABC"
+
+    def _raise(*_a: Any, **_kw: Any) -> None:
+        raise Exception(
+            f"401 Client Error: Unauthorized for url: https://api.telegram.org/bot{token}/getMe"
+        )
+
+    monkeypatch.setattr("integrations.telegram.verifier.requests.get", _raise)
+    result = _verify_telegram("local store", {"bot_token": token})
+    assert result["status"] == "failed"
+    assert token not in result["detail"]
+    assert "<redacted>" in result["detail"]
+
+
 def test_verify_slack_send_test_posts_to_webhook(monkeypatch: pytest.MonkeyPatch) -> None:
     """End-to-end: ``verify_integrations("slack", send_slack_test=True)`` must
     actually deliver the test message through the verifier's HTTP path.
@@ -286,6 +342,42 @@ def test_verify_slack_send_test_false_does_not_post(monkeypatch: pytest.MonkeyPa
     assert "Use --send-slack-test" in results[0]["detail"]
 
 
+def test_verify_slack_mixed_webhook_and_socket_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A config carrying webhook plus Socket Mode tokens must verify, not be
+    rejected by the strict webhook-only model."""
+    monkeypatch.setattr(
+        "integrations.catalog.load_integrations",
+        lambda: [
+            {
+                "id": "slack-local",
+                "service": "slack",
+                "status": "active",
+                "instances": [
+                    {
+                        "name": "default",
+                        "tags": {},
+                        "credentials": {
+                            "webhook_url": "https://hooks.slack.com/services/T000/B000/test",
+                            "bot_token": "xoxb-test",
+                            "app_token": "xapp-test",
+                        },
+                    }
+                ],
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "integrations.slack.verifier.httpx.get",
+        lambda *_args, **_kwargs: _FakeResponse({"ok": True, "team": "testspace"}),
+    )
+
+    results = verify_integrations("slack")
+
+    assert results[0]["status"] == "passed"
+    assert "Webhook configured." in results[0]["detail"]
+    assert "auth.test ok" in results[0]["detail"]
+
+
 def test_verify_slack_uses_v2_store_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "integrations.catalog.load_integrations",
@@ -315,7 +407,7 @@ def test_verify_slack_uses_v2_store_credentials(monkeypatch: pytest.MonkeyPatch)
             "service": "slack",
             "source": "local store",
             "status": "passed",
-            "detail": "Configured. Use --send-slack-test to validate delivery.",
+            "detail": "Webhook configured. Use --send-slack-test to validate delivery.",
         }
     ]
 
@@ -744,6 +836,22 @@ def test_resolve_effective_integrations_includes_vercel_from_env(
     assert vercel is not None
     assert vercel["config"]["api_token"] == "tok_env"
     assert vercel["source"] == "local env"
+
+
+def test_resolve_effective_integrations_includes_railway_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("integrations.catalog.load_integrations", lambda: [])
+    monkeypatch.setenv("RAILWAY_PROJECT", "project_env")
+    monkeypatch.setenv("RAILWAY_SERVICE", "service_env")
+    monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
+
+    effective = resolve_effective_integrations()
+
+    railway = effective.get("railway")
+    assert railway is not None
+    assert railway["config"]["project"] == "project_env"
+    assert railway["source"] == "local env"
 
 
 def test_resolve_effective_integrations_skips_invalid_slack_env_url(

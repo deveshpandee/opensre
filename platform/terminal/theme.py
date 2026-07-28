@@ -15,6 +15,7 @@ Token reference
   WARNING    warnings only — no auth, fallback store, config issues
   ERROR      errors only — missing required config, failures
   BG         terminal background, never used as foreground
+  INPUT_SURFACE  prompt/menu surface background
 
 Usage
 -----
@@ -53,8 +54,8 @@ THEME_REGISTRY: dict[str, CliTheme] = {
         HIGHLIGHT="#B9EDAF",
         BRAND="#66A17D",
         TEXT="#E0E0E0",
-        SECONDARY="#888888",
-        DIM="#444444",
+        SECONDARY="#A6A6A6",
+        DIM="#6E6E6E",
         WARNING="#CEA25C",
         ERROR="#C45B52",
         BG="#0A0A0A",
@@ -65,8 +66,8 @@ THEME_REGISTRY: dict[str, CliTheme] = {
         HIGHLIGHT="#A8D4FF",
         BRAND="#6FA5D8",
         TEXT="#E0E0E0",
-        SECONDARY="#888888",
-        DIM="#444444",
+        SECONDARY="#A6A6A6",
+        DIM="#6E6E6E",
         WARNING="#D8B06F",
         ERROR="#CF6B63",
         BG="#0A0A0A",
@@ -77,8 +78,8 @@ THEME_REGISTRY: dict[str, CliTheme] = {
         HIGHLIGHT="#F2D48A",
         BRAND="#C99944",
         TEXT="#E0E0E0",
-        SECONDARY="#888888",
-        DIM="#444444",
+        SECONDARY="#A6A6A6",
+        DIM="#6E6E6E",
         WARNING="#E0B466",
         ERROR="#CF6B63",
         BG="#0A0A0A",
@@ -89,8 +90,8 @@ THEME_REGISTRY: dict[str, CliTheme] = {
         HIGHLIGHT="#C6C6C6",
         BRAND="#A7A7A7",
         TEXT="#E0E0E0",
-        SECONDARY="#9A9A9A",
-        DIM="#4A4A4A",
+        SECONDARY="#A6A6A6",
+        DIM="#6E6E6E",
         WARNING="#B0B0B0",
         ERROR="#8E8E8E",
         BG="#0A0A0A",
@@ -101,8 +102,8 @@ THEME_REGISTRY: dict[str, CliTheme] = {
         HIGHLIGHT="#FF9E8A",
         BRAND="#C45B52",
         TEXT="#E0E0E0",
-        SECONDARY="#888888",
-        DIM="#444444",
+        SECONDARY="#A6A6A6",
+        DIM="#6E6E6E",
         WARNING="#E0B466",
         ERROR="#CF6B63",
         BG="#0A0A0A",
@@ -113,8 +114,8 @@ THEME_REGISTRY: dict[str, CliTheme] = {
         HIGHLIGHT="#FFB3D9",
         BRAND="#D4729A",
         TEXT="#E0E0E0",
-        SECONDARY="#888888",
-        DIM="#444444",
+        SECONDARY="#A6A6A6",
+        DIM="#6E6E6E",
         WARNING="#E0B466",
         ERROR="#CF6B63",
         BG="#0A0A0A",
@@ -125,8 +126,8 @@ THEME_REGISTRY: dict[str, CliTheme] = {
         HIGHLIGHT="#C8A8FF",
         BRAND="#9678C0",
         TEXT="#E0E0E0",
-        SECONDARY="#888888",
-        DIM="#444444",
+        SECONDARY="#A6A6A6",
+        DIM="#6E6E6E",
         WARNING="#D8B06F",
         ERROR="#CF6B63",
         BG="#0A0A0A",
@@ -137,8 +138,8 @@ THEME_REGISTRY: dict[str, CliTheme] = {
         HIGHLIGHT="#FFC08A",
         BRAND="#D4884A",
         TEXT="#E0E0E0",
-        SECONDARY="#888888",
-        DIM="#444444",
+        SECONDARY="#A6A6A6",
+        DIM="#6E6E6E",
         WARNING="#E0B466",
         ERROR="#CF6B63",
         BG="#0A0A0A",
@@ -149,12 +150,96 @@ THEME_REGISTRY: dict[str, CliTheme] = {
         HIGHLIGHT="#8AE2D6",
         BRAND="#5BA89D",
         TEXT="#E0E0E0",
-        SECONDARY="#888888",
-        DIM="#444444",
+        SECONDARY="#A6A6A6",
+        DIM="#6E6E6E",
         WARNING="#CEA25C",
         ERROR="#C45B52",
         BG="#0A0A0A",
         INPUT_SURFACE="#141414",
+    ),
+    "lime": CliTheme(
+        name="lime",
+        HIGHLIGHT="#D4FF7A",
+        BRAND="#94C845",
+        TEXT="#E0E0E0",
+        SECONDARY="#A6A6A6",
+        DIM="#6E6E6E",
+        WARNING="#CEA25C",
+        ERROR="#C45B52",
+        BG="#0A0A0A",
+        INPUT_SURFACE="#141414",
+    ),
+    "nord": CliTheme(
+        name="nord",
+        HIGHLIGHT="#88C0D0",
+        BRAND="#81A1C1",
+        TEXT="#E5E9F0",
+        SECONDARY="#ACB5C2",
+        DIM="#757D8C",
+        WARNING="#EBCB8B",
+        ERROR="#BF616A",
+        BG="#2E3440",
+        INPUT_SURFACE="#3B4252",
+    ),
+    "dracula": CliTheme(
+        name="dracula",
+        HIGHLIGHT="#BD93F9",
+        BRAND="#8BE9FD",
+        TEXT="#F8F8F2",
+        SECONDARY="#B4B7C5",
+        DIM="#6272A4",
+        WARNING="#F1FA8C",
+        ERROR="#FF5555",
+        BG="#282A36",
+        INPUT_SURFACE="#303443",
+    ),
+    "solarized": CliTheme(
+        name="solarized",
+        HIGHLIGHT="#2AA198",
+        BRAND="#268BD2",
+        TEXT="#EEE8D5",
+        SECONDARY="#99A7A7",
+        DIM="#5F747B",
+        WARNING="#B58900",
+        ERROR="#DC322F",
+        BG="#002B36",
+        INPUT_SURFACE="#073642",
+    ),
+    "gruvbox": CliTheme(
+        name="gruvbox",
+        HIGHLIGHT="#FABD2F",
+        BRAND="#83A598",
+        TEXT="#EBDBB2",
+        SECONDARY="#B2A492",
+        DIM="#787069",
+        WARNING="#FE8019",
+        ERROR="#FB4934",
+        BG="#282828",
+        INPUT_SURFACE="#32302F",
+    ),
+    "webflux": CliTheme(
+        name="webflux",
+        HIGHLIGHT="#E23636",
+        BRAND="#2B63F5",
+        TEXT="#EAF0FF",
+        SECONDARY="#9CA8C6",
+        DIM="#566282",
+        WARNING="#FFC857",
+        ERROR="#FF4D4D",
+        BG="#0D1220",
+        INPUT_SURFACE="#151D33",
+    ),
+    "sunset": CliTheme(
+        name="sunset",
+        HIGHLIGHT="#FFB067",
+        BRAND="#FF6FA8",
+        TEXT="#FFE8D5",
+        SECONDARY="#C8A79B",
+        DIM="#7B605C",
+        WARNING="#FFD166",
+        ERROR="#FF5A5F",
+        BG="#22151A",
+        INPUT_SURFACE="#2B1C24",
     ),
 }
 
@@ -199,6 +284,20 @@ class _LazyRichStyle(str):
 
     def __bool__(self) -> bool:
         return bool(self._resolve())
+
+    # Hash/compare as the resolved style string. The underlying str value is
+    # "" for every token, so without these overrides all tokens collide on
+    # the same key in caches keyed by style strings — Rich's lru_cached
+    # ``Style.parse`` then renders every ``style=TOKEN`` usage with whichever
+    # token happened to be parsed first.
+    def __eq__(self, other: object) -> bool:
+        return self._resolve() == other
+
+    def __ne__(self, other: object) -> bool:
+        return self._resolve() != other
+
+    def __hash__(self) -> int:
+        return hash(self._resolve())
 
     def lstrip(self, chars: str | None = None) -> str:
         resolved = self._resolve()

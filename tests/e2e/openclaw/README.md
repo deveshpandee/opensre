@@ -13,8 +13,9 @@ Parent issue: [#1484](https://github.com/Tracer-Cloud/opensre/issues/1484).
   it's not present, so contributors who haven't installed it can still
   run `make test-cov` without these failing.
 - **Node `22.12+` active in the current shell.** OpenClaw requires
-  it. With `nvm`: run `nvm use` (the repo ships an `.nvmrc` pinning
-  22). Without nvm: `brew install node@22 && brew link --overwrite node@22`.
+  it. With `asdf`/`mise`: run `asdf install` (the repo pins the version
+  in `.tool-versions`). Without a version manager:
+  `brew install node@22 && brew link --overwrite node@22`.
 - Docker daemon running (for any future container-backed fault
   scenarios — not required for the initial gateway-down scenario).
 
@@ -78,5 +79,5 @@ calls the investigation pipeline (gated on
   `tests/e2e/upstream_lambda/test_agent_e2e.py`
 - OpenClaw integration code: `integrations/openclaw.py`
 - Existing unit coverage (do not duplicate):
-  `tests/test_openclaw_integration.py`
-- Test conventions: `tests/AGENTS.md`
+  `tests/integrations/openclaw/test_integration.py`
+- Test conventions: [tests/e2e/AGENTS.md](../../e2e/AGENTS.md)

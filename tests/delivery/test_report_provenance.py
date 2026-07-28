@@ -10,7 +10,6 @@ from tools.investigation.reporting.formatters.report import (
 
 def _make_state() -> dict:
     return {
-        "pipeline_name": "checkout-service",
         "alert_name": "Checkout latency spike",
         "root_cause": "Checkout service was throttled by the upstream API cluster.",
         "root_cause_category": "dependency_failure",
@@ -59,7 +58,6 @@ def test_format_telegram_message_does_not_treat_lonely_asterisk_as_bold() -> Non
     state = _make_state()
     state["severity"] = "warning"
     state["alert_name"] = "Unit"
-    state["pipeline_name"] = "pipe"
     state["root_cause"] = "Check 2 * 3 = 6 before scaling"
     ctx = build_report_context(state)
     body = format_telegram_message(ctx)
@@ -71,7 +69,6 @@ def test_format_telegram_message_renders_double_star_bold_in_root_cause() -> Non
     state = _make_state()
     state["severity"] = "high"
     state["alert_name"] = "HighMemory"
-    state["pipeline_name"] = "checkout"
     state["root_cause"] = "The pod **api-server** exhausted its memory limit"
     ctx = build_report_context(state)
     body = format_telegram_message(ctx)
@@ -85,14 +82,13 @@ def test_format_telegram_message_omits_banner_only_root_cause() -> None:
     state = _make_state()
     state["severity"] = "info"
     state["alert_name"] = "[synthetic-k8s] Scheduled Health Check — payments-api"
-    state["pipeline_name"] = "k8s-eks-synthetic"
     state["root_cause"] = (
         "[synthetic-k8s] Scheduled Health Check — payments-api on k8s-eks-synthetic "
         "(severity: info)"
     )
     ctx = build_report_context(state)
     body = format_telegram_message(ctx)
-    assert body.count("k8s-eks-synthetic") == 1
+    assert "k8s-eks-synthetic" not in body
     assert "Scheduled Health Check — payments-api on k8s-eks-synthetic (severity: info)" not in body
 
 
@@ -107,6 +103,33 @@ def test_format_telegram_message_uses_html_and_severity_header() -> None:
     assert "CRITICAL" in body
     assert "##" not in body
     assert "*Cited Evidence" not in body
+
+
+def test_format_slack_message_shows_incident_command_section() -> None:
+    state = _make_state()
+    state["triage_summary"] = "Triage complete: Critical errors isolated to payments_etl."
+    state["incident_status"] = (
+        "Status — confirmed: alert critical | open: deploy time | next: verify DB | owner: on-call"
+    )
+    state["investigation_hypotheses"] = [
+        "H1: Database outage — confirm: DB error logs; rule out: caller-only misconfig"
+    ]
+    state["verification_summary"] = ["Datadog logs (H1): connection refused errors in payments_etl"]
+    state["follow_up_questions"] = [
+        "Was there a deploy of payments_etl around 14:32 UTC?",
+    ]
+    state["remediation_tradeoffs"] = (
+        "Rollback is fastest; scaling DB is slower but safer. Recommend rollback first."
+    )
+    message = format_slack_message(build_report_context(state))
+
+    assert "## Incident Command" in message
+    assert "Triage complete: Critical errors isolated to payments_etl." in message
+    assert "Triage complete: Triage complete:" not in message
+    assert "*Hypotheses:*" in message
+    assert "*Verification:*" in message
+    assert "*Follow-up questions:*" in message
+    assert "Remediation trade-offs:" in message
 
 
 def test_format_slack_message_shows_provenance() -> None:

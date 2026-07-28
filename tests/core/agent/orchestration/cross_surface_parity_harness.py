@@ -1,8 +1,8 @@
 """Shared harness for cross-surface turn parity tests.
 
-Every client (interactive shell, headless dispatch, ``Agent`` static entry,
-gateway turn handler) must route through the same ``run_turn`` engine and produce
-the same outcome for the same input, tools, and LLM wiring.
+Every client (interactive shell, headless dispatch, gateway turn handler) must
+route through the same ``run_turn`` engine and produce the same outcome for the
+same input, tools, and LLM wiring.
 """
 
 from __future__ import annotations
@@ -15,30 +15,28 @@ from typing import Any, Literal
 
 from rich.console import Console
 
-from core.agent import Agent
-from core.agent_harness.agents.headless_agent import (
+from core.agent_harness.prompts.prompt_context import DefaultPromptContextProvider
+from core.agent_harness.session import InMemorySessionStorage
+from core.agent_harness.tools.tool_provider import DefaultToolProvider
+from core.agent_harness.turns.default_reasoning_client import DefaultReasoningClientProvider
+from core.agent_harness.turns.headless_dispatch import (
     BufferOutputSink,
+    HeadlessAgent,
     NoopTurnAccounting,
-    dispatch_message_to_headless_agent,
 )
-from core.agent_harness.models.turn_results import ShellTurnResult
-from core.agent_harness.providers.default_prompt_context import DefaultPromptContextProvider
-from core.agent_harness.providers.default_providers import (
-    DefaultReasoningClientProvider,
-    DefaultToolProvider,
-)
-from core.agent_harness.session import InMemorySessionStorage, Session
+from core.agent_harness.turns.turn_results import ShellTurnResult
 from core.llm.types import AgentLLMResponse, ToolCall
 from core.tool_framework.registered_tool import RegisteredTool
-from gateway.turn_handler import build_gateway_turn_handler
+from gateway.runtime.turn_handler import GatewayTurnHandler
 from surfaces.interactive_shell.runtime.shell_turn_execution import execute_shell_turn
+from surfaces.interactive_shell.runtime.slash_adapter import headless_slash_ports
+from surfaces.interactive_shell.session import Session
 
-Surface = Literal["shell", "headless", "agent_static", "gateway_handler"]
+Surface = Literal["shell", "headless", "gateway_handler"]
 
 ALL_SURFACES: tuple[Surface, ...] = (
     "shell",
     "headless",
-    "agent_static",
     "gateway_handler",
 )
 
@@ -248,15 +246,20 @@ def probe_run_count() -> int:
 def wire_tool_registry(monkeypatch: Any, tools: list[RegisteredTool]) -> None:
     reset_probe_runs()
     reset_integrations_seen()
-    monkeypatch.setattr(
-        "core.agent_harness.tools.action_tools.get_registered_tools",
-        lambda _surface=None: list(tools),
-    )
     by_name = {tool.name: tool for tool in tools}
-    monkeypatch.setattr(
-        "core.agent_harness.tools.action_tools.get_registered_tool_map",
-        lambda _surface=None: dict(by_name),
-    )
+
+    class _FixedToolRegistry:
+        def tools_for_surface(self, surface: str) -> list[RegisteredTool]:
+            del surface
+            return list(tools)
+
+        def tool_map_for_surface(self, surface: str) -> dict[str, RegisteredTool]:
+            del surface
+            return dict(by_name)
+
+    from platform.harness_ports import set_tool_registry
+
+    set_tool_registry(_FixedToolRegistry())
 
     from core.agent_harness.tools.action_tools import _sources_for_context
 
@@ -270,7 +273,7 @@ def wire_tool_registry(monkeypatch: Any, tools: list[RegisteredTool]) -> None:
         return [tool for tool in tools if tool.is_available(sources)]
 
     monkeypatch.setattr(
-        "core.agent_harness.providers.default_providers.get_action_tools_from_integrations_context",
+        "core.agent_harness.tools.tool_provider.get_action_tools_from_integrations_context",
         _resolve_from_integrations,
     )
     monkeypatch.setattr(
@@ -282,11 +285,14 @@ def wire_tool_registry(monkeypatch: Any, tools: list[RegisteredTool]) -> None:
 def wire_llms(
     monkeypatch: Any, *, action_mode: str, action_tool_name: str = "parity_probe"
 ) -> None:
-    monkeypatch.setattr("core.llm.llm_client.get_llm_for_reasoning", FakeReasoningClient)
-    monkeypatch.setattr(
-        "core.llm.agent_llm_client.get_agent_llm",
-        lambda: FakeActionLLM(action_mode, tool_name=action_tool_name),
-    )
+    from core.llm.factory import LLMRole
+
+    def _fake_get_llm(role: Any) -> Any:
+        if role == LLMRole.AGENT:
+            return FakeActionLLM(action_mode, tool_name=action_tool_name)
+        return FakeReasoningClient()
+
+    monkeypatch.setattr("core.llm.factory.get_llm", _fake_get_llm)
 
 
 def _dispatch_turn(
@@ -296,9 +302,12 @@ def _dispatch_turn(
     gather_enabled: bool = True,
 ) -> ShellTurnResult:
     output = BufferOutputSink()
-    return dispatch_message_to_headless_agent(
-        message,
-        tools=DefaultToolProvider(session, console()),
+    agent = HeadlessAgent(
+        tools=DefaultToolProvider(
+            session,
+            console(),
+            slash_ports_factory=headless_slash_ports,
+        ),
         session=session,
         output=output,
         prompts=DefaultPromptContextProvider(session),
@@ -306,6 +315,7 @@ def _dispatch_turn(
         accounting=NoopTurnAccounting(),
         gather_enabled=gather_enabled,
     )
+    return agent.dispatch(message)
 
 
 def snapshot_shell(message: str, *, integrations: dict[str, Any] | None = None) -> TurnSnapshot:
@@ -328,25 +338,6 @@ def snapshot_headless(message: str, *, integrations: dict[str, Any] | None = Non
     return TurnSnapshot.from_result(result, probe_ran=probe_run_count() > before)
 
 
-def snapshot_agent_static(
-    message: str, *, integrations: dict[str, Any] | None = None
-) -> TurnSnapshot:
-    session = fresh_session(integrations=integrations)
-    output = BufferOutputSink()
-    before = probe_run_count()
-    result = Agent.dispatch_message_to_headless_agent(
-        message,
-        tools=DefaultToolProvider(session, console()),
-        session=session,
-        output=output,
-        prompts=DefaultPromptContextProvider(session),
-        reasoning=DefaultReasoningClientProvider(output=output),
-        accounting=NoopTurnAccounting(),
-        gather_enabled=True,
-    )
-    return TurnSnapshot.from_result(result, probe_ran=probe_run_count() > before)
-
-
 def snapshot_gateway_handler(
     message: str,
     monkeypatch: Any,
@@ -356,16 +347,19 @@ def snapshot_gateway_handler(
     session = fresh_session(integrations=integrations)
     sink = RecordingGatewaySink()
     captured: list[ShellTurnResult] = []
-    real_dispatch = Agent.dispatch_message_to_headless_agent
 
-    def _spy(*args: Any, **kwargs: Any) -> ShellTurnResult:
-        result = real_dispatch(*args, **kwargs)
-        captured.append(result)
-        return result
+    class _SpyAgent(HeadlessAgent):
+        def dispatch(self, message: str) -> ShellTurnResult:
+            result = super().dispatch(message)
+            captured.append(result)
+            return result
 
-    monkeypatch.setattr("gateway.turn_handler.Agent.dispatch_message_to_headless_agent", _spy)
+    monkeypatch.setattr("gateway.runtime.turn_handler.HeadlessAgent", _SpyAgent)
     before = probe_run_count()
-    handler = build_gateway_turn_handler(console=console())
+    handler = GatewayTurnHandler(
+        console=console(),
+        slash_ports_factory=headless_slash_ports,
+    )
     handler(message, session, sink, logging.getLogger("test.parity.gateway"))
     assert len(captured) == 1, "gateway handler must dispatch exactly one headless turn"
     return TurnSnapshot.from_result(captured[0], probe_ran=probe_run_count() > before)
@@ -382,8 +376,6 @@ def run_surface(
         return snapshot_shell(message, integrations=integrations)
     if surface == "headless":
         return snapshot_headless(message, integrations=integrations)
-    if surface == "agent_static":
-        return snapshot_agent_static(message, integrations=integrations)
     if surface == "gateway_handler":
         return snapshot_gateway_handler(message, monkeypatch, integrations=integrations)
     raise AssertionError(f"unknown surface: {surface}")
@@ -430,16 +422,19 @@ def run_gateway_turn_with_sink(
     session = fresh_session(integrations=integrations)
     sink = RecordingGatewaySink()
     captured: list[ShellTurnResult] = []
-    real_dispatch = Agent.dispatch_message_to_headless_agent
 
-    def _spy(*args: Any, **kwargs: Any) -> ShellTurnResult:
-        result = real_dispatch(*args, **kwargs)
-        captured.append(result)
-        return result
+    class _SpyAgent(HeadlessAgent):
+        def dispatch(self, message: str) -> ShellTurnResult:
+            result = super().dispatch(message)
+            captured.append(result)
+            return result
 
-    monkeypatch.setattr("gateway.turn_handler.Agent.dispatch_message_to_headless_agent", _spy)
+    monkeypatch.setattr("gateway.runtime.turn_handler.HeadlessAgent", _SpyAgent)
     before = probe_run_count()
-    handler = build_gateway_turn_handler(console=console())
+    handler = GatewayTurnHandler(
+        console=console(),
+        slash_ports_factory=headless_slash_ports,
+    )
     handler(message, session, sink, logging.getLogger("test.parity.gateway.sink"))
     assert len(captured) == 1, "gateway handler must dispatch exactly one headless turn"
     snapshot = TurnSnapshot.from_result(captured[0], probe_ran=probe_run_count() > before)

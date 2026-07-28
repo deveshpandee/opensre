@@ -13,35 +13,30 @@ from tools.investigation.capability import resolve_investigation_context
 
 
 def test_resolve_investigation_context_prefers_cli_overrides() -> None:
-    alert_name, pipeline_name, severity = resolve_investigation_context(
+    alert_name, severity = resolve_investigation_context(
         raw_alert={
             "alert_name": "PayloadAlert",
-            "pipeline_name": "payload_pipeline",
             "severity": "warning",
         },
         alert_name="CliAlert",
-        pipeline_name="cli_pipeline",
         severity="critical",
     )
 
     assert alert_name == "CliAlert"
-    assert pipeline_name == "cli_pipeline"
     assert severity == "critical"
 
 
-def test_resolve_investigation_context_uses_raw_alert_without_pipeline_default() -> None:
-    alert_name, pipeline_name, severity = resolve_investigation_context(
+def test_resolve_investigation_context_uses_raw_alert_fields() -> None:
+    alert_name, severity = resolve_investigation_context(
         raw_alert={
             "title": "CPU high",
             "commonLabels": {"service": "checkout", "severity": "critical"},
         },
         alert_name=None,
-        pipeline_name=None,
         severity=None,
     )
 
     assert alert_name == "CPU high"
-    assert pipeline_name == "checkout"
     assert severity == "critical"
 
 
@@ -60,19 +55,19 @@ def test_run_investigation_cli_passes_investigation_metadata_to_runner(
             "validity_score": 0.0,
         }
 
-    monkeypatch.setattr("surfaces.cli.investigation.investigate.resolve_llm_settings", object)
+    monkeypatch.setattr("surfaces.cli.investigation.investigate.check_llm_settings", lambda: None)
     monkeypatch.setattr(
         "tools.investigation.capability.run_investigation_payload",
         fake_call,
     )
     run_investigation_cli(
         raw_alert={"description": "x"},
-        investigation_metadata=("A", "B", "high"),
+        investigation_metadata=("A", "high"),
     )
     assert captured == {
         "raw_alert": {"description": "x"},
         "opensre_evaluate": False,
-        "investigation_metadata": ("A", "B", "high"),
+        "investigation_metadata": ("A", "high"),
     }
 
 
@@ -91,7 +86,7 @@ def test_run_investigation_cli_shapes_agent_state(monkeypatch) -> None:
             "root_cause": "bad deploy",
         }
 
-    monkeypatch.setattr("surfaces.cli.investigation.investigate.resolve_llm_settings", object)
+    monkeypatch.setattr("surfaces.cli.investigation.investigate.check_llm_settings", lambda: None)
     monkeypatch.setattr(
         "tools.investigation.capability.run_investigation",
         fake_run_investigation,
@@ -129,7 +124,7 @@ def test_run_investigation_cli_evaluate_reports_skip_when_no_rubric(monkeypatch)
             "opensre_llm_eval": {},
         }
 
-    monkeypatch.setattr("surfaces.cli.investigation.investigate.resolve_llm_settings", object)
+    monkeypatch.setattr("surfaces.cli.investigation.investigate.check_llm_settings", lambda: None)
     monkeypatch.setattr("tools.investigation.capability.run_investigation", fake_run)
 
     result = run_investigation_cli(
@@ -149,6 +144,7 @@ def test_parse_args_evaluate_flag() -> None:
 
 def test_run_investigation_cli_fails_fast_for_missing_llm_auth(monkeypatch, tmp_path) -> None:
     from config.llm_auth.credentials import CredentialStatus
+    from platform.common.errors import OpenSREError
 
     monkeypatch.setenv("LLM_PROVIDER", "openai")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -180,7 +176,7 @@ def test_stream_investigation_cli_raises_queued_exception_immediately(
         yield StreamEvent("metadata", data={"run_id": "run-123"})
         raise RuntimeError("stream failed")
 
-    monkeypatch.setattr("surfaces.cli.investigation.investigate.resolve_llm_settings", object)
+    monkeypatch.setattr("surfaces.cli.investigation.investigate.check_llm_settings", lambda: None)
     monkeypatch.setattr(
         "tools.investigation.capability.astream_investigation",
         fake_astream_investigation,
@@ -206,7 +202,7 @@ def test_stream_investigation_cli_closes_cleanly_on_generator_close(
         # Simulate a long-running stream
         await asyncio.sleep(1000)
 
-    monkeypatch.setattr("surfaces.cli.investigation.investigate.resolve_llm_settings", object)
+    monkeypatch.setattr("surfaces.cli.investigation.investigate.check_llm_settings", lambda: None)
     monkeypatch.setattr(
         "tools.investigation.capability.astream_investigation",
         fake_astream_investigation,
@@ -232,7 +228,7 @@ def test_run_investigation_cli_maps_cli_auth_to_opensre_error(
             detail="Not logged in.",
         )
 
-    monkeypatch.setattr("surfaces.cli.investigation.investigate.resolve_llm_settings", object)
+    monkeypatch.setattr("surfaces.cli.investigation.investigate.check_llm_settings", lambda: None)
     monkeypatch.setattr("tools.investigation.capability.run_investigation", boom)
 
     with pytest.raises(OpenSREError, match="not authenticated") as exc_info:
@@ -252,7 +248,7 @@ def test_stream_investigation_cli_maps_cli_auth_to_opensre_error(
             detail="Not logged in.",
         )
 
-    monkeypatch.setattr("surfaces.cli.investigation.investigate.resolve_llm_settings", object)
+    monkeypatch.setattr("surfaces.cli.investigation.investigate.check_llm_settings", lambda: None)
     monkeypatch.setattr(
         "tools.investigation.capability.astream_investigation",
         fake_astream_investigation,

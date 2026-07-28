@@ -10,10 +10,10 @@ from rich.console import Console
 
 import surfaces.cli.wizard.env_sync as env_sync
 import surfaces.cli.wizard.store as wizard_store
-from core.agent_harness.session import Session
 from surfaces.cli.wizard.config import PROJECT_ENV_PATH, PROJECT_ROOT, PROVIDER_BY_VALUE
 from surfaces.interactive_shell.command_registry import dispatch_slash
 from surfaces.interactive_shell.command_registry import repl_data as repl_data_module
+from surfaces.interactive_shell.session import Session
 
 
 def _capture() -> tuple[Console, io.StringIO]:
@@ -27,6 +27,7 @@ def persistence_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[s
     env_path = tmp_path / "project.env"
     store_path = tmp_path / "opensre.json"
     monkeypatch.setattr(env_sync, "PROJECT_ENV_PATH", env_path)
+    monkeypatch.setattr("config.env_file.PROJECT_ENV_PATH", env_path)
     monkeypatch.setattr(wizard_store, "get_store_path", lambda: store_path)
     return {"env": env_path, "store": store_path}
 
@@ -123,9 +124,7 @@ class TestReplModelPersistence:
         persistence_paths: dict[str, Path],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from core.llm import llm_client
-
-        monkeypatch.setattr(llm_client, "reset_llm_singletons", lambda: None)
+        monkeypatch.setattr("core.llm.factory.reset_llm_clients", lambda: None)
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
 
         console, buf = _capture()
@@ -146,9 +145,7 @@ class TestReplModelPersistence:
         persistence_paths: dict[str, Path],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from core.llm import llm_client
-
-        monkeypatch.setattr(llm_client, "reset_llm_singletons", lambda: None)
+        monkeypatch.setattr("core.llm.factory.reset_llm_clients", lambda: None)
         monkeypatch.setenv("LLM_PROVIDER", "anthropic")
         wizard_store.save_local_config(
             wizard_mode="quickstart",
@@ -176,9 +173,7 @@ class TestReplModelPersistence:
         persistence_paths: dict[str, Path],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from core.llm import llm_client
-
-        monkeypatch.setattr(llm_client, "reset_llm_singletons", lambda: None)
+        monkeypatch.setattr("core.llm.factory.reset_llm_clients", lambda: None)
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
 
         console, buf = _capture()
@@ -202,9 +197,7 @@ class TestReplModelPersistence:
         persistence_paths: dict[str, Path],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from core.llm import llm_client
-
-        monkeypatch.setattr(llm_client, "reset_llm_singletons", lambda: None)
+        monkeypatch.setattr("core.llm.factory.reset_llm_clients", lambda: None)
         monkeypatch.setenv("LLM_PROVIDER", "anthropic")
         wizard_store.save_local_config(
             wizard_mode="quickstart",
@@ -230,9 +223,7 @@ class TestReplModelPersistence:
         persistence_paths: dict[str, Path],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from core.llm import llm_client
-
-        monkeypatch.setattr(llm_client, "reset_llm_singletons", lambda: None)
+        monkeypatch.setattr("core.llm.factory.reset_llm_clients", lambda: None)
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
         monkeypatch.setenv("LLM_PROVIDER", "anthropic")
 
@@ -276,3 +267,26 @@ class TestReplModelPersistence:
         assert "unknown model for anthropic" in buf.getvalue()
         assert not persistence_paths["env"].exists()
         assert not persistence_paths["store"].exists()
+
+    @pytest.mark.parametrize("model", ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"])
+    def test_model_set_accepts_and_persists_gpt56_tiers(
+        self,
+        model: str,
+        persistence_paths: dict[str, Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # #3931 acceptance criterion: ``/model set openai gpt-5.6-<tier>``
+        # is accepted and persists. openai sets ``allow_custom_models``, so
+        # this already held before the quick-picks landed; the test pins it
+        # against a future tightening of the allowlist.
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+        console, buf = _capture()
+        dispatch_slash(f"/model set openai {model}", Session(), console)
+
+        assert "unknown model" not in buf.getvalue()
+        assert f"OPENAI_REASONING_MODEL={model}" in persistence_paths["env"].read_text(
+            encoding="utf-8"
+        )
+        stored = wizard_store.load_local_config(persistence_paths["store"])
+        assert stored["targets"]["local"]["model"] == model

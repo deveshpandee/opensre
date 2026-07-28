@@ -2,17 +2,17 @@ from __future__ import annotations
 
 import pytest
 
-from core.agent_harness.models.turn_context import TurnContext
 from core.agent_harness.prompts import (
     PromptBlock,
     PromptEnvelope,
     build_action_system_prompt,
     build_action_system_prompt_envelope,
 )
+from core.agent_harness.turns.turn_snapshot import TurnSnapshot
 
 
-def _ctx() -> TurnContext:
-    return TurnContext(
+def _ctx() -> TurnSnapshot:
+    return TurnSnapshot(
         text="show connected integrations",
         conversation_messages=(("user", "hello"),),
         configured_integrations=("github",),
@@ -55,11 +55,20 @@ def test_action_system_prompt_envelope_matches_legacy_rendering() -> None:
     ctx = _ctx()
     envelope = build_action_system_prompt_envelope(ctx)
 
+    # "action-agent-vendor-fragments" carries integration-owned prompt recipes
+    # (e.g. Slack/GitHub action routing) registered via
+    # platform.harness_ports.register_action_prompt_fragment — see
+    # integrations/harness_adapters.py. It renders empty (and is absent from
+    # this id list) when no fragments are registered.
     assert [block.id for block in envelope.blocks] == [
         "action-agent-system-base",
+        "action-agent-vendor-fragments",
+        "action-agent-skills",
         "connected-integrations",
         "recent-conversation",
     ]
+    assert envelope.require_block("action-agent-vendor-fragments").kind == "rule"
+    assert envelope.require_block("action-agent-skills").kind == "rule"
     assert envelope.require_block("connected-integrations").kind == "context"
     assert envelope.require_block("recent-conversation").kind == "conversation"
     assert envelope.render() == build_action_system_prompt(ctx)

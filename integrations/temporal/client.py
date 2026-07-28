@@ -11,7 +11,7 @@ import httpx
 
 from integrations.config_models import TemporalIntegrationConfig
 from integrations.probes import ProbeResult
-from platform.observability.service_errors import capture_service_error
+from platform.observability.errors.service import capture_service_error
 
 logger = logging.getLogger(__name__)
 
@@ -307,5 +307,5 @@ class TemporalClient:
     def __enter__(self) -> TemporalClient:
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+    def __exit__(self, exc_type, _exc_val, _exc_tb) -> None:
         self.close()

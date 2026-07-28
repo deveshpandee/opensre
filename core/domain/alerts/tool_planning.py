@@ -3,24 +3,53 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, Protocol
 
-from core.domain.alerts.alert_source import (
-    SECONDARY_TOOL_SOURCES as SECONDARY_SOURCES,
-)
 from core.domain.alerts.alert_source import (
     collect_alert_text,
     primary_sources_for_alert,
     relevant_sources_for_alert,
+    secondary_tool_sources,
 )
 from core.domain.types.planning import PlannedInvestigationAction
+from core.tool_framework.tags import FALLBACK_PLANNING_TAG
 
-FALLBACK_TOOL_NAMES: tuple[str, ...] = ("get_sre_guidance",)
+
+class PlannableTool(Protocol):
+    """Read-only view of the tool fields the alert planner scores against."""
+
+    @property
+    def name(self) -> str:
+        raise NotImplementedError
+
+    @property
+    def source(self) -> str:
+        raise NotImplementedError
+
+    @property
+    def description(self) -> str:
+        raise NotImplementedError
+
+    @property
+    def use_cases(self) -> Sequence[str]:
+        raise NotImplementedError
+
+    @property
+    def examples(self) -> Sequence[str]:
+        raise NotImplementedError
+
+    @property
+    def tags(self) -> Sequence[str]:
+        raise NotImplementedError
+
+    @property
+    def evidence_type(self) -> Any:
+        raise NotImplementedError
 
 
 def score_tools(
     state: dict[str, Any],
-    tools: Sequence[Any],
+    tools: Sequence[PlannableTool],
 ) -> list[PlannedInvestigationAction]:
     primary_sources = set(primary_sources_for_alert(state))
     candidate_sources = {str(tool.source) for tool in tools}
@@ -42,13 +71,14 @@ def score_tools(
     if scored and max(action.score for action in scored) <= 0:
         scored = [score_fallback_tool(action) for action in scored]
 
+    secondary_sources = secondary_tool_sources()
     return sorted(
-        scored, key=lambda item: (-item.score, item.source in SECONDARY_SOURCES, item.name)
+        scored, key=lambda item: (-item.score, item.source in secondary_sources, item.name)
     )
 
 
 def score_tool(
-    tool: Any,
+    tool: PlannableTool,
     *,
     alert_text: str,
     primary_sources: set[str],
@@ -65,7 +95,7 @@ def score_tool(
     if source in relevant_sources:
         score += 70
         reasons.append(f"source '{source}' matches alert context")
-    if source in SECONDARY_SOURCES:
+    if source in secondary_tool_sources():
         score -= 10
         reasons.append("secondary source, used after integration-specific tools")
 
@@ -95,6 +125,7 @@ def score_tool(
         source=source,
         score=score,
         reasons=tuple(reasons),
+        is_fallback=FALLBACK_PLANNING_TAG in tool.tags,
     )
 
 
@@ -112,18 +143,19 @@ def metadata_matches_for_alert(alert_text: str, metadata_text: str) -> list[str]
 def score_fallback_tool(
     action: PlannedInvestigationAction,
 ) -> PlannedInvestigationAction:
-    if action.name not in FALLBACK_TOOL_NAMES:
+    if not action.is_fallback:
         return action
     return PlannedInvestigationAction(
         name=action.name,
         source=action.source,
         score=10,
         reasons=(*action.reasons, "included as deterministic fallback"),
+        is_fallback=True,
     )
 
 
 __all__ = [
-    "FALLBACK_TOOL_NAMES",
+    "PlannableTool",
     "metadata_matches_for_alert",
     "score_fallback_tool",
     "score_tool",

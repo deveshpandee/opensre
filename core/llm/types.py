@@ -4,7 +4,23 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, TypeAlias, runtime_checkable
+
+from core.types import RuntimeTool
+
+ResolvedIntegrations: TypeAlias = dict[str, Any]  # noqa: UP040
+
+ModelType: TypeAlias = Literal["reasoning", "classification", "toolcall"]  # noqa: UP040
+
+
+@dataclass(frozen=True)
+class LLMRoute:
+    """The resolved provider/transport decision shared by every role this turn."""
+
+    settings: Any
+    provider: str  # runtime provider (after auth-method resolution)
+    cli_provider_registration: Any | None
+    use_litellm: bool
 
 
 @dataclass(frozen=True)
@@ -62,7 +78,9 @@ class AgentLLMClient(Protocol):
     def model_id(self) -> str | None:
         """The provider model identifier, used for context-budget sizing (may be None)."""
 
-    def tool_schemas(self, tools: list[Any]) -> list[dict[str, Any]]:
+    def tool_schemas[RuntimeToolT: RuntimeTool](
+        self, tools: list[RuntimeToolT]
+    ) -> list[dict[str, Any]]:
         """Translate runtime tools into the provider's tool-schema payloads."""
 
     def invoke(
@@ -87,6 +105,9 @@ __all__ = [
     "AgentLLMClient",
     "AgentLLMResponse",
     "LLMResponse",
+    "LLMRoute",
+    "ModelType",
+    "ResolvedIntegrations",
     "StreamingReasoningClient",
     "ToolCall",
 ]

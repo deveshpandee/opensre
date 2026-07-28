@@ -16,6 +16,9 @@ _MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "gpt-4o": 128_000,
     "gpt-4.1": 1_000_000,
     "gpt-4": 128_000,
+    # Lookup is first-substring-match in insertion order, so gpt-5.6 must stay
+    # above the gpt-5 catch-all or it is never reached.
+    "gpt-5.6": 1_000_000,
     # gpt-5 window is conservatively pinned to 128k until confirmed for the
     # dated snapshot in use; raise once verified to reclaim headroom.
     "gpt-5": 128_000,
@@ -36,6 +39,19 @@ _TRUNCATION_MIN_TOKENS = 1_000
 
 _PINNED_MESSAGE_KEY = "_opensre_seed"
 _DUPLICATE_RESULT_KEY = "_opensre_duplicate_result"
+
+
+def strip_internal_message_markers(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return a copy of ``messages`` without internal ``_opensre_*`` keys.
+
+    Context-budget eviction tags seed and duplicate tool exchanges with these
+    markers. They must remain on the in-memory transcript for trimming heuristics
+    but are rejected by strict provider message schemas (e.g. Anthropic).
+    """
+    return [
+        {key: value for key, value in message.items() if not key.startswith("_opensre_")}
+        for message in messages
+    ]
 
 
 @dataclass(frozen=True)
@@ -146,6 +162,51 @@ def context_budget_ceiling_for_model(model: str | None) -> int:
     return max(window - _RESPONSE_HEADROOM_TOKENS, _RESPONSE_HEADROOM_TOKENS)
 
 
+def _message_token_estimate(message: dict[str, Any]) -> int:
+    total = 0
+    content = message.get("content", "")
+    if isinstance(content, str):
+        total += int(len(content) * _TOKENS_PER_CHAR)
+    elif isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict):
+                total += int(len(json.dumps(block, default=str)) * _TOKENS_PER_CHAR)
+            elif isinstance(block, str):
+                total += int(len(block) * _TOKENS_PER_CHAR)
+    return total
+
+
+def _message_token_estimates(messages: list[dict[str, Any]]) -> tuple[list[int], int]:
+    tokens = [_message_token_estimate(message) for message in messages]
+    return tokens, sum(tokens)
+
+
+def _estimate_messages_tokens(messages: list[dict[str, Any]]) -> int:
+    return sum(_message_token_estimate(message) for message in messages)
+
+
+def _system_tokens(system: str | None) -> int:
+    return int(len(system) * _TOKENS_PER_CHAR) if system else 0
+
+
+def system_and_tools_overhead(
+    system: str | None,
+    tools: list[dict[str, Any]] | None,
+) -> int:
+    """Fixed token overhead for the system prompt and tool schemas.
+
+    Callers on a hot path (e.g. the investigation ReAct loop) should call this
+    once and pass the result to ``enforce_context_budget`` via
+    ``fixed_overhead_tokens`` so tool schemas are not re-serialized every
+    iteration.
+    """
+    total = _system_tokens(system)
+    if tools:
+        for schema in tools:
+            total += int(len(json.dumps(schema, default=str)) * _TOKENS_PER_CHAR)
+    return total
+
+
 def estimate_message_tokens(
     messages: list[dict[str, Any]],
     *,
@@ -159,23 +220,7 @@ def estimate_message_tokens(
     aggressively while system + tools (tens of thousands of tokens for
     opensre's 100+ tool registry) silently pushed us over the line.
     """
-    total = 0
-    for message in messages:
-        content = message.get("content", "")
-        if isinstance(content, str):
-            total += int(len(content) * _TOKENS_PER_CHAR)
-        elif isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict):
-                    total += int(len(json.dumps(block, default=str)) * _TOKENS_PER_CHAR)
-                elif isinstance(block, str):
-                    total += int(len(block) * _TOKENS_PER_CHAR)
-    if system:
-        total += int(len(system) * _TOKENS_PER_CHAR)
-    if tools:
-        for schema in tools:
-            total += int(len(json.dumps(schema, default=str)) * _TOKENS_PER_CHAR)
-    return total
+    return _estimate_messages_tokens(messages) + system_and_tools_overhead(system, tools)
 
 
 def trim_lowest_value_tool_pair(messages: list[dict[str, Any]]) -> bool:
@@ -267,10 +312,11 @@ def truncate_content(content: Any, max_chars: int) -> tuple[Any, bool]:
 def _truncate_largest_message(
     messages: list[dict[str, Any]],
     *,
-    system: str | None,
-    tools: list[dict[str, Any]] | None,
+    message_tokens: list[int],
+    total_message_tokens: int,
+    fixed_overhead_tokens: int,
     ceiling: int,
-) -> bool:
+) -> tuple[bool, int]:
     """Truncate the biggest still-shrinkable message so the prompt fits.
 
     Tries messages largest-first (so an untruncatable assistant ``tool_calls``
@@ -282,20 +328,21 @@ def _truncate_largest_message(
     """
     order = sorted(
         range(len(messages)),
-        key=lambda i: estimate_message_tokens([messages[i]]),
+        key=message_tokens.__getitem__,
         reverse=True,
     )
     for idx in order:
-        overhead = estimate_message_tokens(
-            [m for i, m in enumerate(messages) if i != idx], system=system, tools=tools
-        )
+        overhead = (total_message_tokens - message_tokens[idx]) + fixed_overhead_tokens
         budget_tokens = max(ceiling - overhead - _TRUNCATION_SAFETY_TOKENS, _TRUNCATION_MIN_TOKENS)
         max_chars = int(budget_tokens / _TOKENS_PER_CHAR)
         new_content, changed = truncate_content(messages[idx].get("content"), max_chars)
         if changed:
             messages[idx]["content"] = new_content
-            return True
-    return False
+            updated_tokens = _message_token_estimate(messages[idx])
+            total_message_tokens += updated_tokens - message_tokens[idx]
+            message_tokens[idx] = updated_tokens
+            return True, total_message_tokens
+    return False, total_message_tokens
 
 
 def enforce_context_budget(
@@ -303,12 +350,28 @@ def enforce_context_budget(
     *,
     system: str | None = None,
     tools: list[dict[str, Any]] | None = None,
+    fixed_overhead_tokens: int | None = None,
     ceiling: int = _TOKEN_BUDGET_CEILING,
 ) -> None:
-    """Trim low-value tool exchanges until the prompt fits under ``ceiling``."""
-    while estimate_message_tokens(messages, system=system, tools=tools) > ceiling:
+    """Trim low-value tool exchanges until the prompt fits under ``ceiling``.
+
+    Pass ``fixed_overhead_tokens`` (from :func:`system_and_tools_overhead`) to
+    skip re-serializing tool schemas on every call.  When omitted the overhead
+    is computed from ``system`` and ``tools``.
+    """
+    if fixed_overhead_tokens is None:
+        fixed_overhead_tokens = system_and_tools_overhead(system, tools)
+    message_tokens, total_message_tokens = _message_token_estimates(messages)
+    while (total_message_tokens + fixed_overhead_tokens) > ceiling:
         if not trim_lowest_value_tool_pair(messages):
-            if not _truncate_largest_message(messages, system=system, tools=tools, ceiling=ceiling):
+            changed, total_message_tokens = _truncate_largest_message(
+                messages,
+                message_tokens=message_tokens,
+                total_message_tokens=total_message_tokens,
+                fixed_overhead_tokens=fixed_overhead_tokens,
+                ceiling=ceiling,
+            )
+            if not changed:
                 logger.warning(
                     "[agent] context still over budget after trimming + truncation "
                     "(ceiling=%d); letting the request proceed",
@@ -319,6 +382,7 @@ def enforce_context_budget(
                 "[agent] truncated oversized message to fit context budget (ceiling=%d)", ceiling
             )
             continue
+        message_tokens, total_message_tokens = _message_token_estimates(messages)
         logger.warning(
             "[agent] trimmed low-value tool pair to fit context budget (ceiling=%d)", ceiling
         )

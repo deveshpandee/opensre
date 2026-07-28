@@ -2,21 +2,21 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import Self
 
-import click
 from prompt_toolkit import PromptSession
 from pydantic import BaseModel, ConfigDict, Field, InstanceOf, field_validator, model_validator
 
 from core.agent_harness.session import SessionManager
-from core.agent_harness.session.state import Session
 from core.domain.alerts import inbox as _alert_inbox
+from platform.observability.trace.spans import set_session_trace_sink
 from surfaces.interactive_shell.runtime.core.state import (
     ReplState,
     SpinnerState,
     create_repl_mutable_state,
 )
+from surfaces.interactive_shell.session.session import Session
+from surfaces.interactive_shell.session.trace_sink import jsonl_trace_sink_for_session
 
 
 class SessionBootstrapSpec(BaseModel):
@@ -50,10 +50,9 @@ class SessionBootstrapSpec(BaseModel):
             hydrate_integrations=self.hydrate_integrations,
             persistent_tasks=self.persistent_tasks,
         )
-        self.session.active_theme_name = self.active_theme_name or _current_theme_name()
-        _bind_shell_grounding(self.session)
+        self.session.terminal.active_theme_name = self.active_theme_name or _current_theme_name()
         if self.pt_session is not None:
-            self.session.prompt_history_backend = self.pt_session.history
+            self.session.terminal.prompt_history_backend = self.pt_session.history
         return self
 
 
@@ -94,7 +93,7 @@ class ReplRuntimeContext(BaseModel):
     def bind_prompt_history_backend(self) -> Self:
         """Keep session prompt-history state aligned with the prompt session."""
         if self.pt_session is not None:
-            self.session.prompt_history_backend = self.pt_session.history
+            self.session.terminal.prompt_history_backend = self.pt_session.history
         return self
 
 
@@ -102,21 +101,6 @@ def _current_theme_name() -> str:
     from platform.terminal.theme import get_active_theme_name
 
     return get_active_theme_name()
-
-
-def _bind_shell_grounding(session: Session) -> None:
-    def _slash_commands() -> Mapping[str, object]:
-        from surfaces.interactive_shell.command_registry import SLASH_COMMANDS
-
-        return SLASH_COMMANDS
-
-    def _cli_command_group() -> click.Command | None:
-        from surfaces.cli.__main__ import cli
-
-        return cli
-
-    session.grounding.set_slash_commands_provider(_slash_commands)
-    session.grounding.set_command_group_provider(_cli_command_group)
 
 
 def prepare_repl_session(
@@ -157,6 +141,7 @@ def create_repl_runtime_context(
         hydrate_integrations=hydrate_integrations,
         persistent_tasks=persistent_tasks,
     )
+    set_session_trace_sink(jsonl_trace_sink_for_session(prepared_session))
     mutable_state = create_repl_mutable_state(state=state, spinner=spinner)
     return ReplRuntimeContext(
         session=prepared_session,

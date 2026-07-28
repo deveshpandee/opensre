@@ -19,6 +19,12 @@ from config.config import (
     NVIDIA_REASONING_MODEL,
     OPENAI_REASONING_MODEL,
     OPENROUTER_REASONING_MODEL,
+    VERTEX_AI_REASONING_MODEL,
+)
+from config.constants.llm import (
+    AZURE_OPENAI_API_KEY_ENV,
+    AZURE_OPENAI_API_VERSION_ENV,
+    AZURE_OPENAI_BASE_URL_ENV,
 )
 from config.llm_auth.provider_catalog import require_provider_spec
 from config.local_env import PROJECT_ROOT as PROJECT_ROOT
@@ -120,6 +126,9 @@ ANTHROPIC_MODELS = (
 # provider uses Chat Completions, while Codex models require a different API path.
 OPENAI_MODELS = (
     ModelOption(value=OPENAI_REASONING_MODEL, label="GPT-5.4 mini"),
+    ModelOption(value="gpt-5.6-sol", label="GPT-5.6 Sol — flagship"),
+    ModelOption(value="gpt-5.6-terra", label="GPT-5.6 Terra — balanced"),
+    ModelOption(value="gpt-5.6-luna", label="GPT-5.6 Luna — cost-efficient"),
     ModelOption(value="gpt-5.5", label="GPT-5.5"),
     ModelOption(value="gpt-5.4", label="GPT-5.4"),
     ModelOption(value="gpt-5.4-nano", label="GPT-5.4 nano"),
@@ -128,6 +137,9 @@ OPENAI_MODELS = (
 # Source: https://openrouter.ai/api/v1/models
 OPENROUTER_MODELS = (
     ModelOption(value=OPENROUTER_REASONING_MODEL, label="OpenRouter Auto (smart routing)"),
+    ModelOption(value="openai/gpt-5.6-sol", label="GPT-5.6 Sol (via OpenRouter)"),
+    ModelOption(value="openai/gpt-5.6-terra", label="GPT-5.6 Terra (via OpenRouter)"),
+    ModelOption(value="openai/gpt-5.6-luna", label="GPT-5.6 Luna (via OpenRouter)"),
     ModelOption(value="openai/gpt-5.5", label="GPT-5.5 (via OpenRouter)"),
     ModelOption(value="anthropic/claude-opus-4.7", label="Claude Opus 4.7 (via OpenRouter)"),
     ModelOption(value="anthropic/claude-sonnet-4.6", label="Claude Sonnet 4.6 (via OpenRouter)"),
@@ -197,20 +209,6 @@ GROQ_MODELS = (
     ModelOption(value="meta-llama/llama-4-scout-17b-16e-instruct", label="Llama 4 Scout 17B"),
 )
 
-# Azure OpenAI model values are deployment names in your resource.
-# Source: https://learn.microsoft.com/en-us/azure/ai-foundry/model-inference/concepts/models
-AZURE_OPENAI_MODELS = (
-    ModelOption(value=AZURE_OPENAI_REASONING_MODEL, label="gpt-5.4-mini deployment"),
-    ModelOption(value="gpt-5.5", label="gpt-5.5 deployment"),
-    ModelOption(value="gpt-5.4", label="gpt-5.4 deployment"),
-    ModelOption(value="gpt-5.4-nano", label="gpt-5.4-nano deployment"),
-    ModelOption(value="gpt-5-mini", label="gpt-5-mini deployment"),
-    ModelOption(value="gpt-5", label="gpt-5 deployment"),
-    ModelOption(value="gpt-4.1", label="gpt-4.1 deployment"),
-    ModelOption(value="gpt-4.1-mini", label="gpt-4.1-mini deployment"),
-    ModelOption(value="o3-mini", label="o3-mini deployment"),
-)
-
 BEDROCK_MODELS = (
     ModelOption(
         value=BEDROCK_REASONING_MODEL,
@@ -258,6 +256,21 @@ BEDROCK_MODELS = (
     ),
 )
 
+VERTEX_AI_MODELS = (
+    ModelOption(value=VERTEX_AI_REASONING_MODEL, label="Gemini 2.5 Pro (Vertex) — default"),
+    ModelOption(value="gemini-2.5-flash", label="Gemini 2.5 Flash (Vertex)"),
+    ModelOption(value="gemini-2.5-flash-lite", label="Gemini 2.5 Flash-Lite (Vertex)"),
+    # Gemini 3.x is Preview-only in Vertex Model Garden as of the July 2026 release
+    # notes (docs.cloud.google.com/vertex-ai/generative-ai/docs/release-notes) — not
+    # curated as the default. Same IDs as the direct Gemini provider's GEMINI_MODELS,
+    # since Vertex serves Gemini under the same publisher-model IDs.
+    ModelOption(value="gemini-3.1-pro-preview", label="Gemini 3.1 Pro (Vertex, preview)"),
+    ModelOption(value="gemini-3-flash-preview", label="Gemini 3 Flash (Vertex, preview)"),
+    ModelOption(
+        value="gemini-3.1-flash-lite-preview", label="Gemini 3.1 Flash-Lite (Vertex, preview)"
+    ),
+)
+
 OLLAMA_MODELS = (
     ModelOption(value="llama3.2", label="Llama 3.2 (3B) — recommended"),
     ModelOption(value="llama3.1:8b", label="Llama 3.1 (8B)"),
@@ -285,7 +298,10 @@ CODEX_MODELS = (
         value="",
         label="CLI default (no -m; use Codex configured model)",
     ),
-    ModelOption(value="gpt-5.5", label="gpt-5.5 — newest frontier coding"),
+    ModelOption(value="gpt-5.6-sol", label="gpt-5.6-sol — newest frontier coding"),
+    ModelOption(value="gpt-5.6-terra", label="gpt-5.6-terra — balanced"),
+    ModelOption(value="gpt-5.6-luna", label="gpt-5.6-luna — fast, cost-efficient"),
+    ModelOption(value="gpt-5.5", label="gpt-5.5 — frontier coding"),
     ModelOption(value="gpt-5.4", label="gpt-5.4 — fallback default"),
     ModelOption(value="gpt-5.4-mini", label="gpt-5.4-mini — fast, cost-efficient"),
     ModelOption(value="gpt-5.3-codex", label="gpt-5.3-codex — coding-optimized"),
@@ -684,6 +700,27 @@ SUPPORTED_PROVIDERS = (
         allow_custom_models=True,
     ),
     ProviderOption(
+        value="vertex-ai",
+        label="Google Vertex AI (ADC auth)",
+        group="Hosted providers",
+        # Intentionally empty: Vertex AI authenticates via Google Application
+        # Default Credentials (gcloud ADC, a service-account key, or GCE/GKE
+        # metadata) — no API key to prompt for, same as Bedrock's IAM auth.
+        api_key_env="",
+        model_env="VERTEX_AI_REASONING_MODEL",
+        default_model=VERTEX_AI_REASONING_MODEL,
+        models=VERTEX_AI_MODELS,
+        toolcall_model_env="VERTEX_AI_TOOLCALL_MODEL",
+        classification_model_env="VERTEX_AI_CLASSIFICATION_MODEL",
+        credential_label="GCP project + region (uses Application Default Credentials)",
+        credential_secret=False,
+        # credential_kind="none" causes flow.py to skip the credential prompt
+        # entirely. Project/region are picked up from VERTEX_AI_PROJECT /
+        # VERTEX_AI_LOCATION, set outside the wizard (same as Bedrock's region).
+        credential_kind="none",
+        allow_custom_models=True,
+    ),
+    ProviderOption(
         value="groq",
         label="Groq API key",
         group="Hosted providers",
@@ -700,15 +737,15 @@ SUPPORTED_PROVIDERS = (
         value="azure-openai",
         label="Azure OpenAI",
         group="Hosted providers",
-        api_key_env="AZURE_OPENAI_API_KEY",
+        api_key_env=AZURE_OPENAI_API_KEY_ENV,
         model_env="AZURE_OPENAI_REASONING_MODEL",
         default_model=AZURE_OPENAI_REASONING_MODEL,
-        models=AZURE_OPENAI_MODELS,
+        models=(),
         legacy_model_env="AZURE_OPENAI_MODEL",
         toolcall_model_env="AZURE_OPENAI_TOOLCALL_MODEL",
         classification_model_env="AZURE_OPENAI_CLASSIFICATION_MODEL",
-        endpoint_env="AZURE_OPENAI_BASE_URL",
-        api_version_env="AZURE_OPENAI_API_VERSION",
+        endpoint_env=AZURE_OPENAI_BASE_URL_ENV,
+        api_version_env=AZURE_OPENAI_API_VERSION_ENV,
         credential_default="https://your-resource.openai.azure.com",
         allow_custom_models=True,
     ),

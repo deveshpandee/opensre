@@ -22,7 +22,6 @@ from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.output import DummyOutput
 
-from core.agent_harness.session import Session
 from platform.terminal import theme as ui_theme
 from platform.terminal.theme import (
     ANSI_RESET,
@@ -33,7 +32,11 @@ from surfaces.interactive_shell.command_registry import SLASH_COMMANDS, dispatch
 from surfaces.interactive_shell.runtime.core import confirmation as controller_runtime
 from surfaces.interactive_shell.runtime.core import state as loop_state
 from surfaces.interactive_shell.runtime.core import turn_detection as loop_turn_detection
+from surfaces.interactive_shell.runtime.investigation_adapter import (
+    repl_investigation_launch_ports,
+)
 from surfaces.interactive_shell.runtime.startup import initial_input as startup_initial_input
+from surfaces.interactive_shell.session import Session
 from surfaces.interactive_shell.ui import input_prompt
 from surfaces.interactive_shell.ui.components.cpr_stdin import (
     strip_cpr_escape_sequences,
@@ -150,9 +153,10 @@ def test_build_prompt_session_uses_persistent_history(
     import config.constants as const_module
 
     monkeypatch.setattr(const_module, "OPENSRE_HOME_DIR", tmp_path)
+    monkeypatch.setattr("config.constants.paths.OPENSRE_HOME_DIR", tmp_path)
 
     with create_app_session(input=DummyInput(), output=DummyOutput()):
-        prompt = input_prompt._build_prompt_session()
+        prompt = input_prompt.build_prompt_session()
 
     assert isinstance(prompt.history, FileHistory)
     assert prompt.history.filename == str(tmp_path / "interactive_history")
@@ -172,9 +176,10 @@ def test_build_prompt_session_falls_back_to_memory_history(
     blocked_home = tmp_path / "not-a-directory"
     blocked_home.write_text("", encoding="utf-8")
     monkeypatch.setattr(const_module, "OPENSRE_HOME_DIR", blocked_home)
+    monkeypatch.setattr("config.constants.paths.OPENSRE_HOME_DIR", blocked_home)
 
     with create_app_session(input=DummyInput(), output=DummyOutput()):
-        prompt = input_prompt._build_prompt_session()
+        prompt = input_prompt.build_prompt_session()
 
     assert isinstance(prompt.history, InMemoryHistory)
 
@@ -186,11 +191,12 @@ def test_repl_session_prompt_history_backend_matches_prompt_toolkit_history(
     import config.constants as const_module
 
     monkeypatch.setattr(const_module, "OPENSRE_HOME_DIR", tmp_path)
+    monkeypatch.setattr("config.constants.paths.OPENSRE_HOME_DIR", tmp_path)
     with create_app_session(input=DummyInput(), output=DummyOutput()):
         session = Session()
-        prompt = input_prompt._build_prompt_session()
-        session.prompt_history_backend = prompt.history
-    assert session.prompt_history_backend is prompt.history
+        prompt = input_prompt.build_prompt_session()
+        session.terminal.prompt_history_backend = prompt.history
+    assert session.terminal.prompt_history_backend is prompt.history
 
 
 def test_prompt_message_uses_accent_glyph() -> None:
@@ -209,13 +215,14 @@ def test_shift_enter_inserts_newline_before_submit(
     import config.constants as const_module
 
     monkeypatch.setattr(const_module, "OPENSRE_HOME_DIR", tmp_path)
+    monkeypatch.setattr("config.constants.paths.OPENSRE_HOME_DIR", tmp_path)
 
     async def _collect() -> str:
         with (
             create_pipe_input() as pipe_input,
             create_app_session(input=pipe_input, output=DummyOutput()),
         ):
-            prompt = input_prompt._build_prompt_session()
+            prompt = input_prompt.build_prompt_session()
             task = asyncio.create_task(prompt.prompt_async(""))
             pipe_input.send_bytes(b"first line")
             pipe_input.send_bytes(_SHIFT_ENTER_SEQUENCE.encode())
@@ -451,9 +458,7 @@ def test_shell_completer_investigate_includes_template_hints() -> None:
     assert any(c.text == "splunk" for c in completions)
 
 
-def test_run_text_investigation_uses_background_launcher_when_mode_enabled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_run_text_investigation_uses_background_launcher_when_mode_enabled() -> None:
     from rich.console import Console
 
     from tools.interactive_shell.actions.investigation import (
@@ -473,16 +478,29 @@ def test_run_text_investigation_uses_background_launcher_when_mode_enabled(
         launches.append((alert_text, display_command))
         return "bg123"
 
-    monkeypatch.setattr(
-        "surfaces.interactive_shell.runtime.background.runner.start_background_text_investigation",
-        _fake_start_background_text_investigation,
-    )
+    def _unexpected_sample_launcher(
+        *,
+        template_name: str,
+        session: Session,
+        console: Console,
+        display_command: str,
+    ) -> str:
+        _ = (template_name, session, console, display_command)
+        raise AssertionError("sample launcher should not run")
 
     session = Session()
-    session.background_mode_enabled = True
+    session.terminal.background_mode_enabled = True
     console = Console(file=io.StringIO(), force_terminal=False, highlight=False)
 
-    run_text_investigation("High CPU alert", session, console)
+    run_text_investigation(
+        "High CPU alert",
+        session,
+        console,
+        ports=repl_investigation_launch_ports(
+            start_background_text=_fake_start_background_text_investigation,
+            start_background_sample=_unexpected_sample_launcher,
+        ),
+    )
 
     assert launches == [("High CPU alert", "background free-text investigation")]
     assert session.task_registry.list_recent(10) == []
@@ -496,8 +514,7 @@ def test_run_initial_input_dispatches_as_non_tty(monkeypatch: pytest.MonkeyPatch
         calls.append(kwargs)
 
     monkeypatch.setattr(
-        startup_initial_input,
-        "execute_shell_turn",
+        "surfaces.interactive_shell.runtime.shell_turn_execution.execute_shell_turn",
         _fake_handle_message,
     )
 
@@ -770,15 +787,26 @@ class TestSpinnerState:
                     break
         assert len(verbs_seen) == 1, f"verb changed mid-turn — saw {verbs_seen}"
 
-    def test_inline_spinner_glyph_animates_across_calls(self) -> None:
-        """Each render advances the frame index — animation in place."""
+    def test_inline_spinner_glyph_animates_with_elapsed_time(self) -> None:
+        """The frame is a function of elapsed time, not of render-call count.
+
+        prompt_toolkit evaluates the prompt message several times per render
+        pass, so a per-call counter freezes the on-screen glyph (it advances a
+        whole number of cycles between visible renders). Repeated calls at one
+        instant must render one frame; advancing the clock must animate.
+        """
         spinner = loop_state.SpinnerState()
         spinner.start()
-        seen = {
+        same_instant = {
             _extract_glyph(spinner.inline_spinner_ansi(), spinner._SPINNER_FRAMES)
             for _ in range(len(spinner._SPINNER_FRAMES) * 2)
         }
-        # Over two full rotations we should see every frame.
+        assert len(same_instant) == 1
+
+        seen = set()
+        for step in range(len(spinner._SPINNER_FRAMES)):
+            spinner.started_at = time.monotonic() - step * spinner._FRAME_INTERVAL_S * 1.001
+            seen.add(_extract_glyph(spinner.inline_spinner_ansi(), spinner._SPINNER_FRAMES))
         assert seen == set(spinner._SPINNER_FRAMES)
 
     def test_stop_returns_to_idle_state(self) -> None:
@@ -1644,7 +1672,7 @@ class TestThemeCommand:
         monkeypatch.setattr(theme_cmd, "repl_choose_one", _fake_choose_one)
 
         session = Session()
-        session.active_theme_name = "pink"
+        session.terminal.active_theme_name = "pink"
         set_active_theme("pink")
         console, _buf = self._capture()
 
@@ -1746,7 +1774,7 @@ class TestThemeCommand:
         theme_cmd._persist_and_report_theme(session, console, "pink")
 
         assert drains == ["drain", "poster", "drain"]
-        assert session.pending_theme_refresh is True
+        assert session.terminal.pending_theme_refresh is True
 
 
 def test_refresh_prompt_theme_skips_invalidate_when_app_not_running() -> None:
@@ -1764,7 +1792,7 @@ def test_refresh_prompt_theme_skips_invalidate_when_app_not_running() -> None:
             invalidated.append(True)
 
     session = Session()
-    session.pt_style_app = _App()
+    session.terminal.prompt_app = _App()
     refresh_prompt_theme(session)
     assert invalidated == []
-    assert session.pt_style_app.style is not None
+    assert session.terminal.prompt_app.style is not None

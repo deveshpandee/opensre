@@ -39,8 +39,9 @@ def status_style(status: str) -> str:
     return {
         "ok": HIGHLIGHT,
         "configured": HIGHLIGHT,
-        "missing": DIM,
-        "failed": WARNING,
+        "passed": HIGHLIGHT,
+        "missing": WARNING,
+        "failed": ERROR,
         "error": ERROR,
     }.get(status, DIM)
 
@@ -136,8 +137,19 @@ def _integration_row(r: dict[str, str]) -> tuple[str | Text, ...]:
     )
 
 
+_CONNECTED_STATUSES = frozenset({"ok", "configured", "passed"})
+
+
 def render_integrations_table(console: Console, results: list[dict[str, str]]) -> None:
-    rows = sorted(results, key=lambda r: r.get("service", ""))
+    # Connected integrations first (so the few a user has actually set up
+    # aren't buried among 50+ "missing" rows), alphabetical within each group.
+    rows = sorted(
+        results,
+        key=lambda r: (
+            r.get("status") not in _CONNECTED_STATUSES,
+            r.get("service", ""),
+        ),
+    )
     if not rows:
         repl_print(
             console, f"[{DIM}]no integrations configured.  try `opensre onboard` to add one.[/]"
@@ -196,7 +208,10 @@ def print_command_output(console: Console, output: str, *, style: str | None = N
     if not output:
         return
     text = output.rstrip()
-    repl_print(console, Text(text) if style is None else Text(text, style=style))
+    # Parse any ANSI the captured child emitted so its Rich styling (bold, colour)
+    # survives being re-printed here instead of showing as raw escape codes.
+    rendered = Text.from_ansi(text) if style is None else Text.from_ansi(text, style=style)
+    repl_print(console, rendered)
 
 
 __all__ = [

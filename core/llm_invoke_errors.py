@@ -63,6 +63,82 @@ def _looks_like_timeout(exc: BaseException) -> bool:
     return False
 
 
+def _is_llm_cli_error(exc: BaseException, class_name: str) -> bool:
+    """True when *exc* is ``integrations.llm_cli.errors.<class_name>`` (matched by name)."""
+    exc_type = type(exc)
+    return exc_type.__name__ == class_name and exc_type.__module__.endswith(
+        "integrations.llm_cli.errors"
+    )
+
+
+def is_cli_timeout_error(exc: BaseException) -> bool:
+    """Return True when *exc* is a CLI subprocess timeout (expected on slow turns)."""
+    return _is_llm_cli_error(exc, "CLITimeoutError")
+
+
+# Turn-error kinds staged when the conversational/action LLM was the intended
+# route for the user's input but the provider failed before a normal reply.
+# The prompt-log recorder uses this set to report a failed LLM turn (model
+# "unknown" plus ``ai_error_kind``) instead of a terminal-action turn
+# (``no_conversational_agent``). Terminal-path kinds (investigation failure
+# categories, background-task "timeout"/"cli_exit_nonzero", slash outcomes)
+# must never appear here.
+LLM_PROVIDER_FAILURE_KINDS = frozenset(
+    {
+        "llm_unavailable",  # reasoning client import/creation failed
+        "llm_timeout",  # conversational stream timed out
+        "assistant_error",  # conversational stream failed mid-turn
+        "action_agent_error",  # action-selection LLM failed for conversational input
+    }
+)
+
+_NOT_CONFIGURED_PATTERNS = (
+    "_api_key",  # env-var style, e.g. "requires ANTHROPIC_API_KEY to be set"
+    "api key is not set",
+    "missing api key",
+    "not available for your account",
+    "marketplace",
+    "inference profile",
+    "not configured",
+    "no llm provider",
+    "llm client unavailable",
+    "billing is not enabled",
+)
+_QUOTA_PATTERNS = ("429", "quota", "rate limit", "too many requests", "credit")
+_AUTH_PATTERNS = (
+    "authentication",
+    "unauthorized",
+    "401",
+    "403",
+    "forbidden",
+    "invalid api key",
+    "incorrect api key",
+    "invalid api_key",
+    "incorrect api_key",
+    "api_key is invalid",
+    "x-api-key",
+)
+
+
+def classify_provider_error_kind(message: str) -> str:
+    """Bucket an LLM provider failure message for analytics filtering.
+
+    Returns one of ``not_configured``, ``quota``, ``auth``, or
+    ``provider_error`` so downstream dashboards can filter provider failures
+    without regexing over response text.
+    """
+    text = message.lower()
+    if any(pattern in text for pattern in _AUTH_PATTERNS):
+        return "auth"
+    if any(pattern in text for pattern in _QUOTA_PATTERNS):
+        return "quota"
+    if any(pattern in text for pattern in _NOT_CONFIGURED_PATTERNS) or (
+        "model" in text and "not found" in text
+    ):
+        return "not_configured"
+    return "provider_error"
+
+
 def classify_llm_invoke_failure(exc: BaseException) -> LLMInvokeFailure | None:
     """Return a structured failure when *exc* is a known operational LLM error.
 
@@ -71,12 +147,7 @@ def classify_llm_invoke_failure(exc: BaseException) -> LLMInvokeFailure | None:
     represents a non-recoverable billing condition that callers must halt
     on, not wrap into a degraded result.
     """
-    from core.llm.llm_retry import LLMCreditExhaustedError
-    from integrations.llm_cli.errors import (
-        CLIAuthenticationRequired,
-        CLIInterruptedError,
-        CLITimeoutError,
-    )
+    from core.llm.shared.llm_retry import LLMCreditExhaustedError
 
     # Fatal — propagate to the runner / operator. Do NOT wrap into the
     # generic "rate-limited" classification (which the text branch below
@@ -84,21 +155,26 @@ def classify_llm_invoke_failure(exc: BaseException) -> LLMInvokeFailure | None:
     if isinstance(exc, LLMCreditExhaustedError):
         return None
 
-    if isinstance(exc, CLIAuthenticationRequired):
+    if _is_llm_cli_error(exc, "CLIAuthenticationRequired"):
+        provider = getattr(exc, "provider", None) or "unknown"
         return LLMInvokeFailure(
             user_message=(
-                f"The {exc.provider} CLI is not authenticated, so the investigation "
-                "could not call the model."
+                f"The {provider} CLI is not authenticated, so the "
+                "investigation could not call the model."
             ),
             tracker_message="Failed: CLI not authenticated",
             remediation_steps=[
-                exc.auth_hint,
-                exc.detail,
-                "Run `opensre doctor` to verify CLI installation and auth.",
+                step
+                for step in (
+                    getattr(exc, "auth_hint", None),
+                    getattr(exc, "detail", None),
+                    "Run `opensre doctor` to verify CLI installation and auth.",
+                )
+                if step
             ],
         )
 
-    if isinstance(exc, CLITimeoutError):
+    if is_cli_timeout_error(exc):
         detail = str(exc).strip() or "The CLI subprocess exceeded its time limit."
         return LLMInvokeFailure(
             user_message=f"Investigation stopped: {detail}",
@@ -107,7 +183,7 @@ def classify_llm_invoke_failure(exc: BaseException) -> LLMInvokeFailure | None:
             root_cause_category="Investigation Error",
         )
 
-    if isinstance(exc, CLIInterruptedError):
+    if _is_llm_cli_error(exc, "CLIInterruptedError"):
         return LLMInvokeFailure(
             user_message="Investigation was interrupted while waiting for the LLM CLI.",
             tracker_message="Failed: LLM interrupted",
@@ -130,6 +206,11 @@ def classify_llm_invoke_failure(exc: BaseException) -> LLMInvokeFailure | None:
     raw = str(exc)
 
     if ("model" in err_msg and "not found" in err_msg) or "404" in err_msg:
+        from core.llm.providers.azure_openai import (
+            azure_deployment_not_found_remediation_steps,
+            is_azure_openai_failure_message,
+        )
+
         if "anthropic" in err_msg and "was not found" in err_msg:
             return LLMInvokeFailure(
                 user_message=raw.strip()
@@ -142,6 +223,13 @@ def classify_llm_invoke_failure(exc: BaseException) -> LLMInvokeFailure | None:
                     ),
                     "Confirm the model ID is valid for your Anthropic account.",
                 ],
+            )
+        if "azure openai deployment" in err_msg or is_azure_openai_failure_message(raw):
+            return LLMInvokeFailure(
+                user_message=raw.strip()
+                or "The configured Azure OpenAI deployment was not found (404).",
+                tracker_message="Failed: Azure deployment not found",
+                remediation_steps=azure_deployment_not_found_remediation_steps(),
             )
         return LLMInvokeFailure(
             user_message=(

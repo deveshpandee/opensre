@@ -9,7 +9,7 @@ import httpx
 from pydantic import field_validator
 
 from config.strict_config import StrictConfigModel
-from platform.observability.service_errors import capture_service_error
+from platform.observability.errors.service import capture_service_error
 
 logger = logging.getLogger(__name__)
 
@@ -103,30 +103,6 @@ class NotionClient:
             capture_service_error(
                 exc, logger=logger, integration="notion", method="create_investigation_page"
             )
-            return {"success": False, "error": str(exc)}
-
-    def update_page(
-        self,
-        page_id: str,
-        content: str,
-    ) -> dict[str, Any]:
-        """Append content blocks to an existing Notion page."""
-        payload = {
-            "children": [_paragraph(content)],
-        }
-        try:
-            with self._get_client() as client:
-                resp = client.patch(f"/blocks/{page_id}/children", json=payload)
-                resp.raise_for_status()
-                return {"success": True, "page_id": page_id}
-        except httpx.HTTPStatusError as exc:
-            capture_service_error(exc, logger=logger, integration="notion", method="update_page")
-            return {
-                "success": False,
-                "error": f"HTTP {exc.response.status_code}: {exc.response.text[:200]}",
-            }
-        except Exception as exc:
-            capture_service_error(exc, logger=logger, integration="notion", method="update_page")
             return {"success": False, "error": str(exc)}
 
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Any, Protocol, TypeGuard, runtime_checkable
+from typing import TYPE_CHECKING, Any, TypeGuard
 
 from rich.text import Text
 
@@ -16,8 +16,6 @@ from surfaces.interactive_shell.ui.output.tool_details import (
     build_tool_detail_text,
     make_tool_detail_record,
     tool_detail_body,
-    tool_short_label,
-    tool_source_label,
 )
 from surfaces.interactive_shell.ui.output.tool_details import (
     format_tool_summary as _format_tool_summary,
@@ -25,24 +23,13 @@ from surfaces.interactive_shell.ui.output.tool_details import (
 from surfaces.interactive_shell.ui.output.tool_details import (
     record_tool_summary as _record_tool_summary,
 )
-from tools.registry import resolve_tool_display_name
+from tools.registry import resolve_tool_activity_labels, resolve_tool_display_name
 
 
 def _is_repl_display(display: object) -> TypeGuard[_ReplEventLogDisplay]:
     from surfaces.interactive_shell.ui.output.repl_display import _ReplEventLogDisplay
 
     return isinstance(display, _ReplEventLogDisplay)
-
-
-@runtime_checkable
-class ToolTrackingSupport(Protocol):
-    """Interface that concrete classes must satisfy to use :class:`ToolTrackingMixin`."""
-
-    def update_subtext(self, node_name: str, text: str, duration: float = 4.0) -> None:
-        raise NotImplementedError
-
-    def print_above_renderable(self, renderable: Any) -> None:
-        raise NotImplementedError
 
 
 class ToolTrackingMixin:
@@ -71,14 +58,13 @@ class ToolTrackingMixin:
         *,
         event_key: str | None = None,
     ) -> None:
-        if self._silent:
-            return
         key = event_key or tool_name
         self._tool_start_times[key] = time.monotonic()
         self._tool_inputs[key] = tool_input
+        if self._silent:
+            return
         _record_tool_summary(tool_name, self._tool_summary_counts, self._tool_summary_order)
-        source = tool_source_label(tool_name)
-        label = tool_short_label(tool_name, source)
+        source, label = resolve_tool_activity_labels(tool_name)
         current = f"{source} · {label}" if label else source
         self.update_subtext("investigation_agent", f"calling {current}...", duration=15.0)
         self.update_subtext("investigate", f"calling {current}...", duration=15.0)
@@ -92,12 +78,13 @@ class ToolTrackingMixin:
         event_key: str | None = None,
         tool_input: Any = None,
     ) -> None:
-        if self._silent:
-            return
         key = event_key or tool_name
         start = self._tool_start_times.pop(key, None)
         elapsed_ms = int((time.monotonic() - start) * 1000) if start is not None else None
         stored_input = self._tool_inputs.pop(key, None)
+        # UI tool tracking only; tool spans are emitted in core.execution.
+        if self._silent:
+            return
         self._update_tool_summary_subtext()
         self._record_tool_detail(
             resolve_tool_display_name(tool_name),

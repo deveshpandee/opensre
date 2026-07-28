@@ -10,8 +10,9 @@ import re
 from typing import Any
 
 from core.tool_framework.tool_decorator import tool
-from core.tool_framework.utils.compaction import compact_logs, summarize_counts
+from core.tool_framework.utils.tool_availability import tool_unavailable
 from integrations.datadog._client import make_async_client
+from platform.common.evidence_compaction import compact_logs, summarize_counts
 
 
 def _run_in_thread(coro: Any) -> Any:
@@ -206,15 +207,14 @@ def fetch_datadog_context(
     """Fetch Datadog logs, monitors, and events in parallel for fast investigation."""
     client = make_async_client(api_key, app_key, site)
     if not client or not client.is_configured:
-        return {
-            "source": "datadog_investigate",
-            "available": False,
-            "error": "Datadog integration not configured",
-            "logs": [],
-            "error_logs": [],
-            "monitors": [],
-            "events": [],
-        }
+        return tool_unavailable(
+            "datadog_investigate",
+            "Datadog integration not configured",
+            logs=[],
+            error_logs=[],
+            monitors=[],
+            events=[],
+        )
 
     events_query = query
     if kube_namespace and kube_namespace not in (query or ""):
@@ -411,7 +411,6 @@ def _logs_extract_params(sources: dict[str, dict]) -> dict[str, Any]:
     display_name="Datadog logs",
     source="datadog",
     tags=("logs", "observability"),
-    cost_tier="moderate",
     description="Search Datadog logs for pipeline errors, exceptions, and application events.",
     use_cases=[
         "Investigating pipeline errors reported by Datadog monitors",
@@ -517,9 +516,8 @@ class QueryDatadogMetricsOutput(BaseModel):
 
 
 def _metrics_is_available(_sources: dict[str, dict]) -> bool:
-    # Hidden from the planner until the Metrics API v2 implementation lands (see #669).
-    # Flip back to `bool(sources.get("datadog", {}).get("connection_verified"))` once
-    # the stub body below is replaced with a real request.
+    # Hidden from the planner until the Metrics API v2 implementation is complete.
+    # Re-enable availability once the stub below is replaced with a real Metrics API request.
     return False
 
 
@@ -570,15 +568,14 @@ def query_datadog_metrics(
     Metrics API (v2) to retrieve time-series data for pipeline performance,
     host resource utilisation, and custom business metrics.
     """
-    return {
-        "source": "datadog_metrics",
-        "available": False,
-        "error": "DataDogMetricsTool is not yet implemented.",
-        "metric_name": metric_name,
-        "time_range_minutes": time_range_minutes,
-        "query": query,
-        "metrics": [],
-    }
+    return tool_unavailable(
+        "datadog_metrics",
+        "DataDogMetricsTool is not yet implemented.",
+        metric_name=metric_name,
+        time_range_minutes=time_range_minutes,
+        query=query,
+        metrics=[],
+    )
 
 
 # ======== from tools/datadog_monitors_tool/ ========

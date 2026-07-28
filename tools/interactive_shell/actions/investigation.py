@@ -9,14 +9,18 @@ from rich.console import Console
 
 from core.agent_harness.tools.tool_context import (
     ActionToolContext,
+    capability_available_from_sources,
     execute_with_action_context,
     object_schema,
     string_property,
 )
 from core.tool_framework.registered_tool import RegisteredTool
 from platform.common.task_types import TaskRecord
-from surfaces.interactive_shell.runtime import Session
-from tools.interactive_shell.shared.investigation_launch import launch_investigation
+from tools.interactive_shell.shared.investigation_launch import (
+    InvestigationLaunchPorts,
+    InvestigationSession,
+    launch_investigation,
+)
 
 
 def normalize_investigation_alert_text(raw: str) -> str:
@@ -29,28 +33,37 @@ def normalize_investigation_alert_text(raw: str) -> str:
 
 def run_text_investigation(
     alert_text: str,
-    session: Session,
+    session: InvestigationSession,
     console: Console,
     *,
+    ports: InvestigationLaunchPorts,
     confirm_fn: Callable[[str], str] | None = None,
     is_tty: bool | None = None,
     action_already_listed: bool = False,
 ) -> None:
     def _run(task: TaskRecord) -> dict[str, object]:
-        from surfaces.cli.investigation import run_investigation_for_session
+        from platform.analytics.cli import track_investigation
+        from platform.analytics.source import EntrypointSource, TriggerMode
 
-        return run_investigation_for_session(
-            alert_text=alert_text,
-            context_overrides=session.accumulated_context or None,
-            cancel_requested=task.cancel_requested,
-        )
+        with (
+            track_investigation(
+                entrypoint=EntrypointSource.CLI_PASTE,
+                trigger_mode=TriggerMode.PASTE,
+                interactive=True,
+                session=session,  # type: ignore[arg-type]
+                investigation_target=alert_text[:120] or None,
+            ) as tracker
+        ):
+            final_state = ports.run_text_investigation(
+                alert_text=alert_text,
+                context_overrides=session.accumulated_context or None,
+                cancel_requested=task.cancel_requested,
+            )
+            tracker.record_loop_metrics_from_state(final_state)
+            return final_state
 
     def _start_background() -> None:
-        from surfaces.interactive_shell.runtime.background.runner import (
-            start_background_text_investigation,
-        )
-
-        start_background_text_investigation(
+        ports.start_background_text(
             alert_text=alert_text,
             session=session,
             console=console,
@@ -60,6 +73,7 @@ def run_text_investigation(
     launch_investigation(
         session=session,
         console=console,
+        ports=ports,
         tool_type="investigation",
         action_summary=f'investigation from text "{alert_text}"',
         announce_label="investigation",
@@ -79,10 +93,13 @@ def execute_investigation_tool(args: dict[str, Any], ctx: ActionToolContext) -> 
     alert_text = normalize_investigation_alert_text(str(args.get("alert_text", "")))
     if not alert_text:
         return False
+    if ctx.investigation_ports is None:
+        raise RuntimeError("investigation tool requires investigation runtime ports")
     run_text_investigation(
         alert_text,
         ctx.session,
         ctx.console,
+        ports=ctx.investigation_ports,
         confirm_fn=ctx.confirm_fn,
         is_tty=ctx.is_tty,
         action_already_listed=ctx.action_already_listed,
@@ -126,6 +143,10 @@ investigation_start_tool = RegisteredTool(
     parallel_safe=False,
     accepts_runtime_context=True,
     run=run_investigation,
+    is_available=lambda sources: capability_available_from_sources(
+        sources,
+        "investigation",
+    ),
 )
 
 

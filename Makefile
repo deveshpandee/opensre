@@ -1,7 +1,29 @@
 -include .env
 export
 
-.PHONY: install onboard benchmark benchmark-update-readme test test-full demo alert-template investigate-alert verify-integrations check-docker grafana-local-up grafana-local-down grafana-local-seed clean lint format deploy deploy-lambda deploy-prefect deploy-flink destroy destroy-lambda destroy-prefect destroy-flink test-deploy prefect-local-test simulate-k8s-alert test-k8s-local test-k8s test-k8s-datadog chaos-mesh-up chaos-mesh-down chaos-engineering-apply chaos-engineering-delete chaos-lab-up chaos-lab-down chaos-experiment-list chaos-experiment-up chaos-experiment-down deploy-dd-monitors cleanup-dd-monitors deploy-eks destroy-eks test-k8s-eks datadog-demo crashloop-demo regen-trigger-config test-rca test-rca-grafana test-synthetic test-rds-synthetic test-cli-smoke test-turn-live download-cloudopsbench-hf mirror-cloudopsbench-s3 validate-cloudopsbench test-openclaw test-openclaw-synthetic test-hermes test-hermes-synthetic test-hermes-synthetic-only refresh-hermes-tuples
+.PHONY: install build onboard demo benchmark benchmark-update-readme \
+	alert-template investigate-alert verify-integrations verify-integrations-smoke check-docker \
+	grafana-local-up grafana-local-down grafana-local-seed \
+	cloudwatch-demo datadog-demo crashloop-demo prefect-demo \
+	flink-demo upstream-downstream \
+	test-rca test-rca-grafana test-synthetic test-rds-synthetic test-k8s-synthetic \
+	test-cloudopsbench download-cloudopsbench-hf validate-cloudopsbench \
+	simulate-k8s-alert test-k8s-local test-k8s test-k8s-datadog test-k8s-eks \
+	chaos-mesh-up chaos-mesh-down chaos-engineering-apply chaos-engineering-delete \
+	chaos-lab-up chaos-lab-down chaos-experiment-list chaos-experiment-up chaos-experiment-down \
+	deploy-dd-monitors cleanup-dd-monitors deploy-eks destroy-eks \
+	trigger-alert trigger-alert-verify regen-trigger-config \
+	prefect-local-test run dev docs-dev \
+	build-image deploy destroy test-deploy \
+	bake-gateway deploy-gateway destroy-gateway \
+	deploy-gateway-direct destroy-gateway-direct \
+	deploy-lambda deploy-prefect deploy-flink destroy-lambda destroy-prefect destroy-flink \
+	test test-full test-cov test-scope test-cli-smoke test-turn-live test-grafana \
+	rabbitmq-local-up rabbitmq-local-down test-rabbitmq-real \
+	test-openclaw test-openclaw-synthetic \
+	test-hermes test-hermes-synthetic test-hermes-synthetic-only refresh-hermes-tuples \
+	clean lint format-check format typecheck vulture \
+	check-imports check-cycles check-layers check-imports-strict check-layers-strict check help
 
 
 ifneq ($(wildcard .venv/bin/python),)
@@ -28,7 +50,7 @@ USER_BASE := $(shell $(PYTHON) -m site --user-base)
 USER_BIN := $(if $(filter Windows_NT,$(OS)),$(USER_BASE)/Scripts,$(USER_BASE)/bin)
 export PATH := $(if $(wildcard .venv/bin),$(CURDIR)/.venv/bin:,$(if $(wildcard .venv/Scripts),$(CURDIR)/.venv/Scripts:))$(USER_BIN):$(PATH)
 
-PYTHON_SOURCE_PATHS := config core integrations platform surfaces tools
+PYTHON_SOURCE_PATHS := config core gateway integrations platform surfaces tools
 
 # Create venv and install dependencies (requires https://docs.astral.sh/uv/)
 install:
@@ -69,6 +91,11 @@ CLOUDOPSBENCH_LIMIT ?=
 
 verify-integrations:
 	uv run opensre integrations verify $(if $(SERVICE),$(SERVICE),) $(if $(SLACK_TEST),--send-slack-test,)
+
+verify-integrations-smoke:
+	$(PYTHON) -m pytest -q \
+	  tests/integrations/test_verification_registry.py \
+	  tests/integrations/test_registry.py
 
 check-docker:
 	@command -v docker >/dev/null 2>&1 || { echo "Docker is required for the live local Grafana stack. Install Docker Desktop or another Docker-compatible runtime, then rerun this target."; exit 1; }
@@ -246,15 +273,12 @@ upstream-downstream:
 flink-demo:
 	$(PYTHON) -m tests.e2e.upstream_apache_flink_ecs.test_agent_e2e
 
-grafana-demo:
-	$(PYTHON) -m tests.e2e.grafana.grafana_pipeline
-
 # Run the generic CLI (reads from stdin or --input)
 run:
 	opensre investigate
 
 dev:
-	@echo "Run the health app with: uv run uvicorn config.webapp:app --reload --host 0.0.0.0 --port 8000"
+	@echo "Run the health app with: uv run uvicorn gateway.http.webapp:app --reload --host 0.0.0.0 --port 8000"
 
 docs-dev:
 	cd docs && mint dev
@@ -262,14 +286,38 @@ docs-dev:
 
 # Deploy all test case infrastructure in parallel (SDK - fast!)
 # EC2 deploy (web + gateway containers on one instance)
+# Step 1 — build once per code change, saves URI locally for reuse:
+build-image:
+	$(PYTHON) -m platform.deployment.ecr_deploy.lifecycle build-image
+
+# Step 2 — launch instance using the pre-built image (fast, no Docker build):
 deploy:
-	$(PYTHON) -m platform.deployment.lifecycle deploy
+	$(PYTHON) -m platform.deployment.ecr_deploy.lifecycle deploy
 
 destroy:
-	$(PYTHON) -m platform.deployment.lifecycle destroy
+	$(PYTHON) -m platform.deployment.ecr_deploy.lifecycle destroy
 
 test-deploy:
 	$(PYTHON) -m pytest tests/deployment/ec2/ -v -s
+
+# Gateway deploy (Telegram and/or Slack Socket Mode; no Docker/ECR)
+# Step 1 — bake once per code change (launches temp EC2, installs opensre, snapshots AMI):
+bake-gateway:
+	$(PYTHON) -m platform.deployment.gateway.lifecycle bake-ami
+
+# Step 2 — launch gateway instance from pre-baked AMI (fast):
+deploy-gateway:
+	$(PYTHON) -m platform.deployment.gateway.lifecycle deploy
+
+destroy-gateway:
+	$(PYTHON) -m platform.deployment.gateway.lifecycle destroy
+
+# Gateway direct deploy (no pre-baked AMI — installs inline via SSM)
+deploy-gateway-direct:
+	$(PYTHON) -m platform.deployment.gateway.lifecycle deploy-direct
+
+destroy-gateway-direct:
+	$(PYTHON) -m platform.deployment.gateway.lifecycle destroy-direct
 
 # Deploy Lambda test case
 deploy-lambda:
@@ -323,7 +371,7 @@ test-scope:
 
 # Run the CLI smoke suite against the installed opensre entrypoint.
 test-cli-smoke:
-	$(PYTHON) -m pytest -v tests/cli_smoke_test.py
+	$(PYTHON) -m pytest -v tests/cli/test_smoke.py
 
 # Run the live-LLM turn scenario suite sharded across local processes, mirroring
 # the CI turn-live job. The suite is IO-bound on LLM calls, so running all shards
@@ -357,7 +405,7 @@ rabbitmq-local-down:
 
 # Run OpenClaw integration + tool E2E tests (mocked transport, no live OpenClaw needed)
 test-openclaw:
-	$(PYTHON) -m pytest tests/e2e/openclaw/ tests/test_openclaw_integration.py tests/tools/test_openclaw_mcp_tool.py tests/utils/test_openclaw_delivery.py -v
+	$(PYTHON) -m pytest tests/e2e/openclaw/ tests/integrations/openclaw/test_integration.py tests/tools/test_openclaw_mcp_tool.py tests/utils/test_openclaw_delivery.py -v
 
 # Run synthetic OpenClaw investigation scenarios (FixtureOpenClawBackend, no live OpenClaw)
 test-openclaw-synthetic:
@@ -420,6 +468,10 @@ format:
 typecheck:
 	$(PYTHON) -m mypy $(PYTHON_SOURCE_PATHS)
 
+# Dead-code scan (reads [tool.vulture] from pyproject.toml; advisory only, not in CI)
+vulture:
+	$(PYTHON) -m vulture
+
 # Import graph: cycles + layering + forbidden direct edges (one command).
 check-imports:
 	$(PYTHON) .github/ci/check_imports.py
@@ -440,10 +492,16 @@ check: lint format-check typecheck check-imports test-full
 help:
 	@echo "Available commands:"
 	@echo ""
-	@echo "  EC2 DEPLOY"
-	@echo "  make deploy            - Build image and deploy web + gateway on EC2"
-	@echo "  make destroy           - Terminate EC2 instance and clean up"
+	@echo "  EC2 DEPLOY (Docker/ECR — web + gateway)"
+	@echo "  make build-image       - Build and push Docker image to ECR (run once per code change)"
+	@echo "  make deploy            - Launch EC2 instance using pre-built image (fast, no Docker build)"
+	@echo "  make destroy           - Terminate EC2 instance and clean up (keeps ECR image; OPENSRE_DESTROY_PURGE_ECR=1 to also delete it)"
 	@echo "  make test-deploy       - Run EC2 deployment e2e tests"
+	@echo ""
+	@echo "  GATEWAY DEPLOY (systemd, no Docker — gateway only)"
+	@echo "  make bake-gateway    - Bake a gateway AMI (run once per code change; saves AMI id locally)"
+	@echo "  make deploy-gateway  - Launch gateway EC2 instance from pre-baked AMI (fast)"
+	@echo "  make destroy-gateway - Terminate gateway instance and clean up (set OPENSRE_GATEWAY_DESTROY_PURGE_AMI=1 to also deregister AMI)"
 	@echo ""
 	@echo "  E2E TEST INFRA (AWS SDK)"
 	@echo "  make deploy-lambda     - Deploy Lambda stack (~50s)"
@@ -460,6 +518,7 @@ help:
 	@echo "  make alert-template TEMPLATE=datadog - Print a starter alert JSON template"
 	@echo "  make investigate-alert ALERT=/path/to/alert.json - Run RCA against your own alert payload"
 	@echo "  make verify-integrations - Check local store + .env integrations before running RCA"
+	@echo "  make verify-integrations-smoke - Fast registry/catalog contract tests (CI smoke gate)"
 	@echo "  make prefect-demo    - Run Prefect ECS Fargate E2E test (alias for demo)"
 	@echo "  make prefect-local-test - Run Prefect ECS local test (CLOUD=1 for ECS)"
 	@echo "  make flink-demo      - Run Apache Flink ECS E2E test"
@@ -515,6 +574,7 @@ help:
 	@echo "  make format          - Format code with ruff"
 	@echo "  make typecheck       - Type check with mypy"
 	@echo "  make check-imports   - Import cycles, layers, and direct-edge checks"
+	@echo "  make check-layers-strict - Full transitive layer contracts (.importlinter.strict)"
 	@echo "  make check           - Run all checks"
 	@echo "  make benchmark		  - Run benchmark report generation"
 	@echo "  make benchmark-update-readme - Update README from cached benchmark results"

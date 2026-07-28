@@ -1,4 +1,4 @@
-"""Tests for the model pricing table and $/hr computation (#2023)."""
+"""Tests for the model pricing table and $/hr computation (#2023, #4035)."""
 
 from __future__ import annotations
 
@@ -6,9 +6,8 @@ import logging
 
 import pytest
 
-from tools.fleet_monitoring.meters import TokenUsage
-from tools.fleet_monitoring.pricing import (
-    MODEL_PRICES,
+from tools.system.fleet_monitoring.meters import TokenUsage
+from tools.system.fleet_monitoring.pricing import (
     PriceOverride,
     normalize_model_name,
     usd_for_usage,
@@ -20,7 +19,8 @@ from tools.fleet_monitoring.pricing import (
 
 class TestUsdPerTokenBlended:
     def test_known_claude_model(self) -> None:
-        # claude-sonnet-4-5: 3 USD/M input, 15 USD/M output, 70/30 blend.
+        # claude-sonnet-4-5 (litellm's model_cost table): 3 USD/M input,
+        # 15 USD/M output, 70/30 blend.
         # Expected: 0.7 * 3e-6 + 0.3 * 15e-6 = 2.1e-6 + 4.5e-6 = 6.6e-6.
         rate = usd_per_token_blended("claude-sonnet-4-5")
         assert rate is not None
@@ -44,23 +44,105 @@ class TestUsdPerTokenBlended:
         assert usd_per_token_blended(None) is None
 
     def test_dated_suffix_falls_back_to_family(self) -> None:
-        # ``claude-sonnet-4-5-20251015`` (date-suffixed id from a
-        # future release that we have not added explicitly to the
-        # table) should still resolve via the family prefix.
+        # ``claude-sonnet-4-5-20251015`` (a future release id litellm's
+        # bundled table does not have yet) resolves via the bare family
+        # alias, which litellm does carry.
         rate = usd_per_token_blended("claude-sonnet-4-5-20251015")
         assert rate == usd_per_token_blended("claude-sonnet-4-5")
 
-    def test_family_prefix_does_not_collide_with_shorter_family(self) -> None:
-        # ``claude-opus-4-1`` must NOT match the ``claude-opus-4``
-        # family before the longer ``claude-opus-4-1`` entry — the
-        # opus-4-1 rate would otherwise be misread as opus-4.
-        opus_4 = usd_per_token_blended("claude-opus-4")
+    def test_dated_sibling_does_not_collide_with_shorter_family(self) -> None:
+        # ``claude-opus-4-1`` must resolve to its own rate rather than
+        # collapsing onto an unrelated, older sibling in the same family.
+        opus_4_20250514 = usd_per_token_blended("claude-opus-4-20250514")
         opus_4_1 = usd_per_token_blended("claude-opus-4-1")
-        # Both happen to be the same today; the regression we guard
-        # against is a future opus-4-1 with different rates getting
-        # silently shadowed by a generic ``claude-opus-4`` rule.
-        assert opus_4 is not None
+        assert opus_4_20250514 is not None
         assert opus_4_1 is not None
+
+    def test_price_matches_litellm_local_snapshot_directly(self) -> None:
+        # Regression guard that this is actually wired to litellm's *local*
+        # snapshot — not a hardcoded number that happens to agree with it
+        # today, and not the shared ``litellm.model_cost`` global (which can
+        # diverge from the local snapshot after a live fetch elsewhere in
+        # the process; see the module docstring).
+        from tools.system.fleet_monitoring.pricing import _litellm_local_cost_map
+
+        entry = _litellm_local_cost_map()["claude-sonnet-4-5"]
+        expected = 0.7 * entry["input_cost_per_token"] + 0.3 * entry["output_cost_per_token"]
+        assert usd_per_token_blended("claude-sonnet-4-5") == pytest.approx(expected)
+
+    def test_local_snapshot_loads_a_substantial_table(self) -> None:
+        # Startup-time smoke guard: if litellm's packaged JSON file is ever
+        # missing/unreadable, _litellm_local_cost_map degrades to an empty
+        # dict rather than crashing the always-on sampler (see its
+        # docstring) — but that failure mode must be loud in CI, not silent.
+        from tools.system.fleet_monitoring.pricing import _litellm_local_cost_map
+
+        assert len(_litellm_local_cost_map()) > 1000
+
+
+class TestGpt56Family:
+    """GPT-5.6 Sol / Terra / Luna (#3931) — the confirmed litellm gap.
+
+    litellm's bundled table doesn't have this family yet (GA'd 2026-07-09).
+    Rates from https://developers.openai.com/api/docs/pricing, per 1M
+    tokens: sol 5/30, terra 2.50/15, luna 1/6. Cached input is 90% off.
+    """
+
+    @pytest.mark.parametrize(
+        ("model", "input_usd_per_million", "output_usd_per_million"),
+        [
+            ("gpt-5.6-sol", 5.00, 30.00),
+            ("gpt-5.6-terra", 2.50, 15.00),
+            ("gpt-5.6-luna", 1.00, 6.00),
+        ],
+    )
+    def test_published_rates(
+        self, model: str, input_usd_per_million: float, output_usd_per_million: float
+    ) -> None:
+        from tools.system.fleet_monitoring.pricing import _LOCAL_MODEL_PRICES
+
+        price = _LOCAL_MODEL_PRICES[model]
+        assert price.usd_per_input_token == pytest.approx(input_usd_per_million / 1e6)
+        assert price.usd_per_output_token == pytest.approx(output_usd_per_million / 1e6)
+        # Cached input reads are 90% off uncached input.
+        assert price.usd_per_cache_read_input_token == pytest.approx(
+            input_usd_per_million / 1e6 * 0.10
+        )
+
+    def test_sol_is_not_priced_as_base_gpt5(self) -> None:
+        # The regression this whole entry exists to prevent: before #3931,
+        # ``gpt-5.6-sol`` matched the ``gpt-5`` family catch-all and was
+        # silently billed at the base gpt-5 rate (1.25/10) — a 4x
+        # under-report on the flagship, with no error and no ``-`` cell.
+        assert usd_per_token_blended("gpt-5.6-sol") != usd_per_token_blended("gpt-5")
+
+    def test_tiers_are_distinctly_priced(self) -> None:
+        # Each tier must resolve to its own rate rather than collapsing
+        # onto a sibling via the shared ``gpt-5.6`` prefix.
+        sol = usd_per_token_blended("gpt-5.6-sol")
+        terra = usd_per_token_blended("gpt-5.6-terra")
+        luna = usd_per_token_blended("gpt-5.6-luna")
+        assert sol is not None and terra is not None and luna is not None
+        assert sol > terra > luna
+
+    def test_bare_alias_resolves_to_sol(self) -> None:
+        # OpenAI routes the bare ``gpt-5.6`` alias to Sol server-side, so
+        # billing it as anything else would mis-report real spend.
+        assert usd_per_token_blended("gpt-5.6") == usd_per_token_blended("gpt-5.6-sol")
+        assert normalize_model_name("gpt-5.6") == "gpt-5.6-sol"
+
+    def test_unknown_tier_suffix_does_not_borrow_sol_rate(self) -> None:
+        # ``gpt-5.6-terra-preview`` must land on terra, not on Sol via the
+        # shorter ``gpt-5.6`` alias prefix. This is what the per-tier
+        # family rows buy us over a single alias row.
+        assert usd_per_token_blended("gpt-5.6-terra-preview") == usd_per_token_blended(
+            "gpt-5.6-terra"
+        )
+
+    def test_openai_provider_prefix_resolves(self) -> None:
+        # OpenRouter-style ids (``openai/gpt-5.6-sol``) are stripped to the
+        # bare model before lookup.
+        assert usd_per_token_blended("openai/gpt-5.6-sol") == usd_per_token_blended("gpt-5.6-sol")
 
 
 class TestUsdPerHour:
@@ -107,7 +189,7 @@ class TestUsdForUsage:
 
     def test_codex_cached_input_clamp_logs_debug(self, caplog: pytest.LogCaptureFixture) -> None:
         usage = TokenUsage(input_tokens=100, cached_input_tokens=500)
-        with caplog.at_level(logging.DEBUG, logger="tools.fleet_monitoring.pricing"):
+        with caplog.at_level(logging.DEBUG, logger="tools.system.fleet_monitoring.pricing"):
             usd_for_usage(usage, "gpt-5-codex")
 
         assert "cached_input_tokens exceeded input_tokens" in caplog.text
@@ -156,36 +238,48 @@ class TestNormalizeModelName:
     def test_at_default_variant_resolves_to_base(self) -> None:
         assert normalize_model_name("claude-sonnet-4-5@default") == "claude-sonnet-4-5"
 
+    def test_legacy_direct_api_id_normalizes_to_itself(self) -> None:
+        # claude-3-5-sonnet-20241022 is the confirmed litellm gap (only
+        # present under Bedrock-routed keys upstream) — covered by the
+        # local override table, and must still normalize cleanly.
+        assert normalize_model_name("claude-3-5-sonnet-20241022") == "claude-3-5-sonnet-20241022"
+
 
 class TestFamilyFallbackCoherence:
-    """Drift guards on ``_FAMILY_FALLBACKS`` ↔ ``MODEL_PRICES``."""
+    """Drift guards on ``_LOCAL_FAMILY_FALLBACKS`` ↔ ``_LOCAL_MODEL_PRICES``."""
 
     def test_family_fallbacks_are_longest_prefix_first(self) -> None:
-        from tools.fleet_monitoring.pricing import _FAMILY_FALLBACKS
+        from tools.system.fleet_monitoring.pricing import _LOCAL_FAMILY_FALLBACKS
 
-        lengths = [len(prefix) for prefix, _canonical_id in _FAMILY_FALLBACKS]
+        lengths = [len(prefix) for prefix, _canonical_id in _LOCAL_FAMILY_FALLBACKS]
         assert lengths == sorted(lengths, reverse=True)
 
     def test_every_family_fallback_canonical_id_has_a_price(self) -> None:
-        # Without this guard, a typo in ``_FAMILY_FALLBACKS``'s
+        # Without this guard, a typo in ``_LOCAL_FAMILY_FALLBACKS``'s
         # canonical id would silently break the family-prefix path:
         # ``_lookup_price`` would return ``None`` for what looks like
         # a known model and the dashboard would render ``-``.
-        from tools.fleet_monitoring.pricing import _FAMILY_FALLBACKS
+        from tools.system.fleet_monitoring.pricing import (
+            _LOCAL_FAMILY_FALLBACKS,
+            _LOCAL_MODEL_PRICES,
+        )
 
-        for prefix, canonical_id in _FAMILY_FALLBACKS:
-            assert canonical_id in MODEL_PRICES, (
-                f"family prefix {prefix!r} → canonical {canonical_id!r} not present in MODEL_PRICES"
+        for prefix, canonical_id in _LOCAL_FAMILY_FALLBACKS:
+            assert canonical_id in _LOCAL_MODEL_PRICES, (
+                f"family prefix {prefix!r} → canonical {canonical_id!r} not present "
+                "in _LOCAL_MODEL_PRICES"
             )
 
 
-class TestModelPricesTable:
+class TestKnownModelCoverage:
     def test_claude_code_default_models_have_prices(self) -> None:
         # Defensive regression: the most common claude-code models
         # must each return a price so the dashboard does not silently
         # degrade to ``-`` after a routine model bump.
+        # claude-3-5-sonnet-20241022 is litellm's confirmed legacy gap,
+        # covered by the local override table.
         for model in ("claude-sonnet-4-5", "claude-opus-4-1", "claude-3-5-sonnet-20241022"):
-            assert model in MODEL_PRICES or usd_per_token_blended(model) is not None
+            assert usd_per_token_blended(model) is not None
 
     def test_claude_fable_5_has_a_price(self) -> None:
         # #3621: claude-fable-5 must not render ``-`` on the dashboard.
@@ -210,4 +304,51 @@ class TestModelPricesTable:
         # Same guarantee for the codex side. ``gpt-5-codex`` is the
         # default model the Codex CLI configures for paid accounts.
         for model in ("gpt-5", "gpt-5-codex", "gpt-4o"):
-            assert model in MODEL_PRICES or usd_per_token_blended(model) is not None
+            assert usd_per_token_blended(model) is not None
+
+
+class TestConfiguredProviderCompatibility:
+    """Coverage sweep across every provider in config/llm_auth/provider_catalog.py.
+
+    Providers wired through ``core/llm/providers/openai_compat_providers.py``
+    (openrouter, deepseek, gemini, nvidia, minimax, groq, ollama) report a
+    *bare* model name — never litellm's own ``<provider>/<model>`` prefix
+    convention (see ``select_compat_model``). These tests use that real wire
+    format, not a guessed one.
+    """
+
+    def test_deepseek_bare_model_has_a_price(self) -> None:
+        assert usd_per_token_blended("deepseek-chat") is not None
+
+    def test_gemini_bare_model_has_a_price(self) -> None:
+        assert usd_per_token_blended("gemini-2.5-pro") is not None
+
+    def test_azure_deployment_named_after_its_model_has_a_price(self) -> None:
+        # Azure deployment names are arbitrary; this is the common case
+        # where the deployment happens to be named after its model.
+        assert usd_per_token_blended("gpt-4o") is not None
+
+    def test_groq_bare_model_resolves_via_compat_provider_fallback(self) -> None:
+        # litellm only keys this under "groq/llama-3.3-70b-versatile"; the
+        # bare id Groq's own API (and OpenSRE's wire format) actually uses
+        # must still resolve.
+        assert usd_per_token_blended("llama-3.3-70b-versatile") is not None
+
+    def test_minimax_bare_mixed_case_model_resolves(self) -> None:
+        # litellm keys MiniMax under "minimax/MiniMax-M2.1" (mixed case);
+        # OpenSRE's wire format sends the bare, differently-cased id.
+        assert usd_per_token_blended("MiniMax-M2.1") is not None
+
+    def test_nvidia_nim_is_unpriced_not_invented(self) -> None:
+        # litellm's snapshot has zero NVIDIA NIM coverage today. This must
+        # render "-" on the dashboard (via PriceOverride/agents.yaml), never
+        # a guessed rate. If this starts failing because litellm added NIM
+        # coverage, that's a welcome change — update this test, don't just
+        # delete it.
+        assert usd_per_token_blended("meta/llama-3.1-70b-instruct") is None
+
+    def test_ollama_self_hosted_is_unpriced(self) -> None:
+        # Self-hosted models have no per-token API price to look up; this is
+        # exactly the gap the compute-basis ($/GPU-hr) pricing_basis from
+        # the #3965 discussion is for, not something litellm can answer.
+        assert usd_per_token_blended("llama3") is None

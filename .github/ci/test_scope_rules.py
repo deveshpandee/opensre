@@ -72,7 +72,6 @@ RULES: tuple[PathRule, ...] = (
         "integrations/google_docs/",
         (
             "tests/integrations/google_docs/",
-            "tests/test_google_docs.py",
             "tests/tools/test_google_docs_create_report_tool.py",
             "tests/tools/test_telemetry.py",
         ),
@@ -536,20 +535,23 @@ RULES: tuple[PathRule, ...] = (
         ),
     ),
     PathRule("integrations/", ("tests/integrations/",)),
-    PathRule("tools/fleet_monitoring/", ("tests/agent/", "tests/fleet_monitoring/")),
+    PathRule("tools/system/fleet_monitoring/", ("tests/agent/", "tests/fleet_monitoring/")),
     PathRule("surfaces/cli/", ("tests/cli/",)),
     PathRule("surfaces/interactive_shell/", ("tests/interactive_shell/",)),
     PathRule("gateway/", ("gateway/tests/",)),
-    PathRule("tools/watch_dog/", ("tests/watch_dog/",)),
+    PathRule("tools/system/watch_dog/", ("tests/watch_dog/",)),
     PathRule("tools/", ("tests/tools/",)),
     PathRule("platform/analytics/", ("tests/analytics/",)),
-    PathRule("platform/guardrails/", ("tests/test_guardrails/",)),
+    PathRule("platform/guardrails/", ("tests/platform/guardrails/",)),
     PathRule("platform/masking/", ("tests/masking/",)),
     PathRule("platform/packaging/", ("tests/packaging/",)),
     PathRule("platform/sandbox/", ("tests/sandbox/",)),
-    PathRule("platform/deployment/", ("tests/deployment/", "tests/test_deployment_health.py")),
+    PathRule(
+        "platform/deployment/",
+        ("tests/deployment/", "tests/platform/deployment/test_deployment_health.py"),
+    ),
     PathRule("platform/auth/", ("tests/platform/auth/",)),
-    PathRule("config/webapp.py", ("tests/test_webapp.py",)),
+    PathRule("gateway/http/webapp.py", ("gateway/tests/http/test_webapp.py",)),
     # Repo-wide config
     PathRule("pyproject.toml", (), always_escalate=True),
     PathRule("uv.lock", (), always_escalate=True),
@@ -593,7 +595,14 @@ def classify(changed: list[str]) -> tuple[bool, list[str], list[str]]:
                         targets.append(target)
             break
 
-        if not matched and path.startswith("tests/") and path not in targets:
+        # Only .py files are pytest-collectible; passing fixture/scenario data
+        # files (.json/.yml) as raw targets aborts the whole run with exit 4.
+        if (
+            not matched
+            and path.startswith("tests/")
+            and path.endswith(".py")
+            and path not in targets
+        ):
             targets.append(path)
 
     if len(areas) >= ESCALATION_AREA_THRESHOLD:

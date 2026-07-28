@@ -11,19 +11,21 @@ from core.agent_harness.prompts.conversation_memory import (
     format_recent_conversation,
 )
 from core.agent_harness.prompts.envelope import PromptBlock, PromptEnvelope
+from core.agent_harness.prompts.skills_loader import load_skills_block
+from platform.harness_ports import action_prompt_vendor_fragments
 
 if TYPE_CHECKING:
-    from core.agent_harness.models.turn_context import TurnContext
+    from core.agent_harness.turns.turn_snapshot import TurnSnapshot
 
 _MAX_TEXT_LEN = 512
 _USER_TEMPLATE = "USER MESSAGE (literal): <<<{text}>>>"
 
 
-def build_action_system_prompt(turn_ctx: TurnContext) -> str:
-    return build_action_system_prompt_envelope(turn_ctx).render()
+def build_action_system_prompt(turn_snapshot: TurnSnapshot) -> str:
+    return build_action_system_prompt_envelope(turn_snapshot).render()
 
 
-def build_action_system_prompt_envelope(turn_ctx: TurnContext) -> PromptEnvelope:
+def build_action_system_prompt_envelope(turn_snapshot: TurnSnapshot) -> PromptEnvelope:
     blocks = [
         PromptBlock(
             id="action-agent-system-base",
@@ -31,27 +33,59 @@ def build_action_system_prompt_envelope(turn_ctx: TurnContext) -> PromptEnvelope
             content=_SYSTEM_PROMPT_BASE + "\n\n",
             provenance="core.agent_harness.prompts.action_agent_system_prompt",
         ),
+    ]
+    vendor_fragments = action_prompt_vendor_fragments()
+    if vendor_fragments:
+        blocks.append(
+            PromptBlock(
+                id="action-agent-vendor-fragments",
+                kind="rule",
+                content=vendor_fragments + "\n\n",
+                provenance="platform.harness_ports.action_prompt_vendor_fragments",
+            )
+        )
+    skills = load_skills_block()
+    if skills:
+        blocks.append(
+            PromptBlock(
+                id="action-agent-skills",
+                kind="rule",
+                content=skills + "\n\n",
+                provenance="core.agent_harness.prompts.skills",
+            )
+        )
+    blocks += [
         PromptBlock(
             id="connected-integrations",
             kind="context",
-            content=connected_integrations_block(turn_ctx),
-            provenance="core.agent_harness.models.turn_context",
+            content=connected_integrations_block(turn_snapshot),
+            provenance="core.agent_harness.turns.turn_snapshot",
         ),
         PromptBlock(
             id="recent-conversation",
             kind="conversation",
-            content=recent_conversation_block(turn_ctx),
-            provenance="core.agent_harness.models.turn_context",
+            content=recent_conversation_block(turn_snapshot),
+            provenance="core.agent_harness.turns.turn_snapshot",
         ),
     ]
-    action_facts = prior_action_facts_block(turn_ctx)
+    action_facts = prior_action_facts_block(turn_snapshot)
     if action_facts:
         blocks.append(
             PromptBlock(
                 id="prior-action-facts",
                 kind="context",
                 content=action_facts,
-                provenance="core.agent_harness.models.turn_context",
+                provenance="core.agent_harness.turns.turn_snapshot",
+            )
+        )
+    memory_block = long_term_memory_block()
+    if memory_block:
+        blocks.append(
+            PromptBlock(
+                id="long-term-memory",
+                kind="context",
+                content=memory_block,
+                provenance="core.domain.memory",
             )
         )
     return PromptEnvelope.from_blocks(
@@ -61,10 +95,10 @@ def build_action_system_prompt_envelope(turn_ctx: TurnContext) -> PromptEnvelope
     )
 
 
-def connected_integrations_block(turn_ctx: TurnContext) -> str:
+def connected_integrations_block(turn_snapshot: TurnSnapshot) -> str:
     """Render which integrations are connected for this shell action turn."""
-    known = turn_ctx.configured_integrations_known
-    configured = turn_ctx.configured_integrations
+    known = turn_snapshot.configured_integrations_known
+    configured = turn_snapshot.configured_integrations
     if known and configured:
         listing = ", ".join(sorted(str(name) for name in configured))
     elif known:
@@ -81,8 +115,8 @@ def connected_integrations_block(turn_ctx: TurnContext) -> str:
     return f"CONNECTED INTEGRATIONS (this install, right now): {listing}\n{gate_note}\n"
 
 
-def recent_conversation_block(turn_ctx: TurnContext) -> str:
-    history = format_recent_conversation(list(turn_ctx.conversation_messages))
+def recent_conversation_block(turn_snapshot: TurnSnapshot) -> str:
+    history = format_recent_conversation(list(turn_snapshot.conversation_messages))
     return (
         "RECENT CONVERSATION (context only, oldest first; previous assistant messages "
         "may contain shell stdout, computed values, and prior tool inputs/results. Use "
@@ -92,8 +126,8 @@ def recent_conversation_block(turn_ctx: TurnContext) -> str:
     )
 
 
-def prior_action_facts_block(turn_ctx: TurnContext) -> str:
-    facts = format_prior_action_facts(list(turn_ctx.conversation_messages))
+def prior_action_facts_block(turn_snapshot: TurnSnapshot) -> str:
+    facts = format_prior_action_facts(list(turn_snapshot.conversation_messages))
     if not facts:
         return ""
     return (
@@ -101,6 +135,30 @@ def prior_action_facts_block(turn_ctx: TurnContext) -> str:
         "outputs; use these values when the USER MESSAGE refers to previous "
         "results, sent messages, comparisons, or 'both/that/them'. Do NOT ask "
         f"the user to paste values already listed here):\n{facts}\n\n"
+    )
+
+
+def long_term_memory_block() -> str:
+    """Inject stored memory facts into every action-agent turn when available."""
+    from core.domain.memory import (
+        ensure_memory_store,
+        memory_available_here,
+        render_prompt_index,
+    )
+
+    if not memory_available_here():
+        return ""
+    ensure_memory_store()
+    rendered = render_prompt_index()
+    if not rendered:
+        return ""
+    return (
+        "LONG-TERM MEMORY (durable facts from ~/.opensre/memory — injected into "
+        "every turn). Use listed facts when planning; when the USER MESSAGE "
+        "contains a new useful durable fact, call memory_remember in this turn "
+        "even if they never said remember/save — do not wait for special phrasing. "
+        "Prefer updating an existing name over near-duplicates:\n"
+        f"{rendered}\n\n"
     )
 
 
@@ -119,6 +177,7 @@ __all__ = [
     "build_action_system_prompt",
     "build_action_user_message",
     "connected_integrations_block",
+    "long_term_memory_block",
     "prior_action_facts_block",
     "recent_conversation_block",
     "sanitize_action_text",

@@ -13,6 +13,10 @@ from typing import Literal
 
 from pydantic import Field, ValidationError, field_validator, model_validator
 
+from config.constants.llm import (
+    AZURE_OPENAI_API_VERSION_ENV,
+    AZURE_OPENAI_BASE_URL_ENV,
+)
 from config.llm_auth.auth_method import (
     LLM_AUTH_METHOD_ENV,
     effective_llm_provider,
@@ -21,7 +25,6 @@ from config.llm_auth.auth_method import (
 from config.llm_auth.credentials import status as credential_status
 from config.llm_auth.provider_catalog import (
     API_KEY_PROVIDER_ENVS,
-    KEYLESS_PROVIDER_VALUES,
     SUPPORTED_PROVIDER_VALUES,
 )
 from config.local_env import bootstrap_opensre_env
@@ -70,6 +73,28 @@ CLERK_CONFIG_PROD = ClerkConfig(
     jwks_url="https://clerk.tracer.cloud/.well-known/jwks.json",
     issuer="https://clerk.tracer.cloud",
 )
+
+# Env vars injected by the org-silo infra (ECS task definition) to point JWT
+# verification at the silo's own Clerk instance instead of the defaults above.
+CLERK_ISSUER_ENV = "CLERK_ISSUER"
+CLERK_JWKS_URL_ENV = "CLERK_JWKS_URL"
+
+
+def get_clerk_config_override() -> ClerkConfig | None:
+    """Return the Clerk instance configured via CLERK_ISSUER / CLERK_JWKS_URL.
+
+    The org-silo infra injects these per deployment; when ``CLERK_ISSUER`` is
+    unset, callers fall back to the hardcoded ``CLERK_CONFIG_DEV`` /
+    ``CLERK_CONFIG_PROD`` defaults. ``CLERK_JWKS_URL`` defaults to the
+    issuer's standard ``/.well-known/jwks.json`` path when omitted. Read at
+    call time (not import time) so env loaded by ``bootstrap_opensre_env``
+    and test monkeypatching are honored.
+    """
+    issuer = os.getenv(CLERK_ISSUER_ENV, "").strip().rstrip("/")
+    if not issuer:
+        return None
+    jwks_url = os.getenv(CLERK_JWKS_URL_ENV, "").strip() or f"{issuer}/.well-known/jwks.json"
+    return ClerkConfig(jwks_url=jwks_url, issuer=issuer)
 
 
 def get_environment() -> Environment:
@@ -160,6 +185,12 @@ BEDROCK_REASONING_MODEL = "us.anthropic.claude-sonnet-4-6"
 BEDROCK_CLASSIFICATION_MODEL = "us.anthropic.claude-sonnet-4-6"
 BEDROCK_TOOLCALL_MODEL = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
+# Google Vertex AI model constants (Gemini models served via Vertex; ADC auth)
+VERTEX_AI_REASONING_MODEL = "gemini-2.5-pro"
+VERTEX_AI_CLASSIFICATION_MODEL = "gemini-2.5-flash"
+VERTEX_AI_TOOLCALL_MODEL = "gemini-2.5-flash-lite"
+DEFAULT_VERTEX_AI_LOCATION = "us-central1"
+
 # Ollama local model constants
 DEFAULT_OLLAMA_MODEL = "llama3.2"
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
@@ -176,6 +207,7 @@ LLMProvider = Literal[
     "minimax",
     "groq",
     "azure-openai",
+    "vertex-ai",
     "codex",
     "cursor",
     "claude-code",
@@ -188,8 +220,15 @@ LLMProvider = Literal[
     "pi",
 ]
 
-KEYLESS_LLM_PROVIDERS = KEYLESS_PROVIDER_VALUES
 LLM_PROVIDER_API_KEY_ENVS = API_KEY_PROVIDER_ENVS
+
+# Runtime identifiers for ``LLMProvider`` members. Branch on these instead of
+# bare string literals when routing on the active provider.
+PROVIDER_ANTHROPIC: LLMProvider = "anthropic"
+PROVIDER_OPENAI: LLMProvider = "openai"
+PROVIDER_BEDROCK: LLMProvider = "bedrock"
+PROVIDER_OLLAMA: LLMProvider = "ollama"
+PROVIDER_VERTEX_AI: LLMProvider = "vertex-ai"
 
 
 def get_configured_llm_provider() -> str:
@@ -205,14 +244,6 @@ def get_llm_provider_api_key_env(provider: str | None = None) -> str | None:
     if effective_llm_provider(provider_name, auth_method) != provider_name:
         return None
     return LLM_PROVIDER_API_KEY_ENVS.get(provider_name)
-
-
-def get_llm_provider_api_key(provider: str | None = None) -> tuple[str | None, str]:
-    """Return an env API key only; Keychain reads are request-scoped now."""
-    env_var = get_llm_provider_api_key_env(provider)
-    if env_var is None:
-        return None, ""
-    return env_var, os.getenv(env_var, "").strip()
 
 
 def _llm_api_key_payload(provider: str) -> dict[str, str]:
@@ -338,9 +369,9 @@ def _llm_settings_env_payload(provider: str) -> dict[str, object]:
             os.getenv("GROQ_MODEL", GROQ_TOOLCALL_MODEL),
         ).strip()
         or GROQ_TOOLCALL_MODEL,
-        "azure_openai_base_url": os.getenv("AZURE_OPENAI_BASE_URL", "").strip(),
+        "azure_openai_base_url": os.getenv(AZURE_OPENAI_BASE_URL_ENV, "").strip(),
         "azure_openai_api_version": os.getenv(
-            "AZURE_OPENAI_API_VERSION", DEFAULT_AZURE_OPENAI_API_VERSION
+            AZURE_OPENAI_API_VERSION_ENV, DEFAULT_AZURE_OPENAI_API_VERSION
         ).strip()
         or DEFAULT_AZURE_OPENAI_API_VERSION,
         "azure_openai_reasoning_model": os.getenv(
@@ -370,6 +401,24 @@ def _llm_settings_env_payload(provider: str) -> dict[str, object]:
             "BEDROCK_TOOLCALL_MODEL", BEDROCK_TOOLCALL_MODEL
         ).strip()
         or BEDROCK_TOOLCALL_MODEL,
+        "vertex_ai_project": os.getenv("VERTEX_AI_PROJECT", "").strip(),
+        "vertex_ai_location": os.getenv("VERTEX_AI_LOCATION", DEFAULT_VERTEX_AI_LOCATION).strip()
+        or DEFAULT_VERTEX_AI_LOCATION,
+        "vertex_ai_reasoning_model": os.getenv(
+            "VERTEX_AI_REASONING_MODEL",
+            os.getenv("VERTEX_AI_MODEL", VERTEX_AI_REASONING_MODEL),
+        ).strip()
+        or VERTEX_AI_REASONING_MODEL,
+        "vertex_ai_classification_model": os.getenv(
+            "VERTEX_AI_CLASSIFICATION_MODEL",
+            os.getenv("VERTEX_AI_MODEL", VERTEX_AI_CLASSIFICATION_MODEL),
+        ).strip()
+        or VERTEX_AI_CLASSIFICATION_MODEL,
+        "vertex_ai_toolcall_model": os.getenv(
+            "VERTEX_AI_TOOLCALL_MODEL",
+            os.getenv("VERTEX_AI_MODEL", VERTEX_AI_TOOLCALL_MODEL),
+        ).strip()
+        or VERTEX_AI_TOOLCALL_MODEL,
         "ollama_model": os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL).strip()
         or DEFAULT_OLLAMA_MODEL,
         "ollama_host": os.getenv("OLLAMA_HOST", DEFAULT_OLLAMA_HOST).strip() or DEFAULT_OLLAMA_HOST,
@@ -424,6 +473,11 @@ class LLMSettings(StrictConfigModel):
     bedrock_reasoning_model: str = BEDROCK_REASONING_MODEL
     bedrock_classification_model: str = BEDROCK_CLASSIFICATION_MODEL
     bedrock_toolcall_model: str = BEDROCK_TOOLCALL_MODEL
+    vertex_ai_project: str = ""
+    vertex_ai_location: str = DEFAULT_VERTEX_AI_LOCATION
+    vertex_ai_reasoning_model: str = VERTEX_AI_REASONING_MODEL
+    vertex_ai_classification_model: str = VERTEX_AI_CLASSIFICATION_MODEL
+    vertex_ai_toolcall_model: str = VERTEX_AI_TOOLCALL_MODEL
     max_tokens: int = Field(default=DEFAULT_MAX_TOKENS, gt=0)
 
     @field_validator("ollama_host", mode="before")
@@ -437,7 +491,7 @@ class LLMSettings(StrictConfigModel):
     @field_validator("azure_openai_base_url", mode="before")
     @classmethod
     def _normalize_azure_openai_base_url(cls, value: object) -> str:
-        from core.llm.azure_openai import normalize_azure_openai_base_url
+        from core.llm.providers.azure_openai import normalize_azure_openai_base_url
 
         return normalize_azure_openai_base_url(str(value or ""))
 
@@ -650,6 +704,13 @@ BEDROCK_LLM_CONFIG = LLMModelConfig(
     reasoning_model=BEDROCK_REASONING_MODEL,
     classification_model=BEDROCK_CLASSIFICATION_MODEL,
     toolcall_model=BEDROCK_TOOLCALL_MODEL,
+    max_tokens=DEFAULT_MAX_TOKENS,
+)
+
+VERTEX_AI_LLM_CONFIG = LLMModelConfig(
+    reasoning_model=VERTEX_AI_REASONING_MODEL,
+    classification_model=VERTEX_AI_CLASSIFICATION_MODEL,
+    toolcall_model=VERTEX_AI_TOOLCALL_MODEL,
     max_tokens=DEFAULT_MAX_TOKENS,
 )
 

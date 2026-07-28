@@ -23,11 +23,11 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from rich.console import Console
 
-from core.agent_harness.session import Session
 from integrations.telegram.credentials import TelegramCredentials
 from platform.common.task_types import TaskKind, TaskStatus
 from surfaces.interactive_shell.command_registry import dispatch_slash
-from tools.fleet_monitoring.probe import ProcessSnapshot
+from surfaces.interactive_shell.session import Session
+from tools.system.fleet_monitoring.probe import ProcessSnapshot
 
 
 def _capture() -> tuple[Console, io.StringIO]:
@@ -57,7 +57,7 @@ def test_repl_watchdog_end_to_end_demo_script(monkeypatch: pytest.MonkeyPatch) -
         status="running",
         started_at=started_at,
     )
-    monkeypatch.setattr("tools.watch_dog.monitor.probe", lambda *_a, **_kw: snap)
+    monkeypatch.setattr("tools.system.watch_dog.monitor.probe", lambda *_a, **_kw: snap)
 
     session = Session()
     console, buf = _capture()

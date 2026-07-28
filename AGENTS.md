@@ -1,4 +1,4 @@
-## Tracer Development Reference
+## OpenSRE Development Reference
 
 ## Build and Run commands
 
@@ -10,89 +10,153 @@
 
 - Use strict typing, follow DRY principle
 - One clear purpose per file (separation of concerns)
+- Use named constants for HTTP status codes (`http.HTTPStatus`, e.g.
+  `HTTPStatus.PAYMENT_REQUIRED`) in both source and tests — never hardcoded
+  numeric literals like `402`.
+- Env-var names and shared static constants live under `config/`, never inline
+  in a feature module or duplicated across files. Put them in a domain module
+  under `config/constants/` (e.g. `config/constants/billing.py`,
+  `config/constants/llm.py`) — a leaf that any layer can import without a cycle —
+  and re-export via `config/constants/__init__.py`. Do **not** define shared env
+  names in `config/config.py`: it imports `config.llm_auth.*`, so a name it and
+  one of those modules both need would force a cyclic import. Only a name used
+  solely inside `config/config.py` (nothing it imports needs it) may live there.
 - Do not keep compatibility-only forwarding modules after refactors. Once imports and tests
   are migrated, remove the old module path in the same change and use one canonical import path.
 
-Before any push or PR creation follow **[CI.md](CI.md)** — lint, format, typecheck, and test commands all live there.
+### Docs under `docs/`
+
+`docs/` is user-facing. Test every sentence: *does this change what the reader
+does?* If not, cut it.
+
+- Cut vendor API endpoints (`getMe`), internal function names, which credential
+  tier a value lands in, and the bug a change fixed — that belongs in the PR
+  description or a module docstring.
+- Keep required vs optional, shortcuts that save real work, gotchas that are
+  invisible until they bite, and the exact commands and env vars they type.
+- Say "a chat the bot was never added to fails during setup", not "`getChat`
+  returns `ok: false`".
+
+### Performance (algorithms & data structures)
+
+Apply on the **hot path** (per-request / per-iteration / per-tool-call); leave cold
+code simple. Complexity must be deliberate — the simplest structure that meets the
+asymptotic need, and no more.
+
+- **Membership / dedup in a loop → `set`/`dict`, never `x in list`.** List `in` is
+  O(n); a set is O(1). (frozen dataclasses are hashable, so `set()` works on them.)
+- **Resolve once, reuse.** Don't re-scan for something already looked up — if you
+  fetched an object from a map, read its fields directly instead of a second linear
+  scan. Build an O(1) `{name: obj}` map instead of scanning a list by name.
+- **No `deepcopy` / `json.dumps` on the hot path.** If the result is invariant after
+  construction, compute it once (`functools.cached_property` / a stored field) and
+  treat it read-only. Verify no caller mutates a shared cached object first.
+- **Sort the light thing, once.** Sort keys/names (strings), not heavy objects, and
+  don't re-sort the same collection twice for two outputs.
+- **Right structure for the job:** `collections.deque` for queues/both-ends,
+  `heapq` for top-k, `bisect` for sorted search, `OrderedDict.move_to_end` /
+  `functools.lru_cache` for bounded caches, `"".join(parts)` never `+=` in a loop.
+- **Behavior-preserving refactors are TDD-guarded:** add a characterization test that
+  pins the observable behavior, confirm it passes on the *pre*-refactor code, then
+  keep it green through the change. Optimize only after; keep any benchmark in the PR.
+
+### File placement (all packages)
+
+When adding or changing behavior, put code in the **owning module first** — not the nearest
+shared file that already imports something similar.
+
+| Kind of file | Should contain | Should not contain |
+| --- | --- | --- |
+| **Orchestration** (`flow.py`, `controller.py`, `lifecycle.py`, `factory.py`) | Stage ordering, wiring, dispatch to specialists | Vendor/provider/domain logic, API clients, heavy UI |
+| **Shared UI / prompts** (`_ui.py`, `prompts.py`, generic `validation.py`) | Reusable prompts, tables, rendering, thin dispatch | Logic for one provider, integration, or vendor |
+| **Domain / provider / vendor module** (`providers/<name>.py`, `surfaces/cli/wizard/<name>.py`, `integrations/<vendor>/`) | All behavior specific to that provider, vendor, or feature area | Unrelated providers or cross-cutting orchestration |
+| **Registry / catalog** (`config.py`, `*_catalog.py`, `provider_registry.py`) | Metadata, defaults, discovery tables | Live API calls, onboarding prompts, retry loops |
+
+**Rules:**
+
+1. **Two or more functions for the same provider, vendor, or feature area** → add or extend
+   a dedicated module (or subpackage) for that area. Do not grow a shared orchestration or UI
+   file with provider-specific branches.
+2. **Before editing a shared file**, check for an existing sibling pattern in the same
+   package (`local_llm/`, `providers/azure_openai.py`, `integrations/<vendor>/tools/`, etc.).
+   Match that layout before inventing a new one.
+3. **Keep dispatch thin.** Shared entrypoints (`validate_provider_credentials`, `get_llm`,
+   slash-command handlers) should delegate in a few lines; implementation lives downstream.
+4. **Respect package boundaries** in [ARCHITECTURE.md](docs/ARCHITECTURE.md). Surfaces compose
+   lower tiers; `core/` and `integrations/` do not import from `surfaces/`.
+5. **Package-local detail** lives in that package's `AGENTS.md` when present (e.g.
+   [`surfaces/interactive_shell/AGENTS.md`](surfaces/interactive_shell/AGENTS.md),
+   [`core/llm/AGENTS.md`](core/llm/AGENTS.md)). Read it before structural changes in that tree.
+6. **Tool location** follows [docs/tool-placement-policy.md](docs/tool-placement-policy.md)
+   (vendor-specific vs `tools/system/` vs cross-vendor).
+
+If a change would add a new provider-specific `if provider.value == ...` block to a file
+that already serves multiple providers, stop and extract a dedicated module instead.
+
+Before any push or PR creation follow [**CI.md**](CI.md) — lint, format, typecheck, and test commands all live there.
+
+When opening a PR, fill out the [**PR template**](.github/PULL_REQUEST_TEMPLATE.md) — it is not optional boilerplate; it has a required AI-usage disclosure section.
 
 ## 1. Repo Map
 
-| Path                  | What it does                                                                                       |
-| --------------------- | -------------------------------------------------------------------------------------------------- |
-| `core/`               | Investigation orchestration, context assembly, the shared runtime tool-calling loop, and domain logic (state, types, correlation rules). Includes `core/tool_framework/` — the `BaseTool` base class, `@tool` decorator, registered-tool primitives, error telemetry, skill-guidance helpers, and shared payload utilities (`utils/`). |
-| `surfaces/cli/`       | Command-line interface, onboarding wizard, local LLM helpers, and CLI tests support.               |
-| `surfaces/interactive_shell/` | Interactive terminal (REPL) loop, slash commands, chat/help surfaces, action-planning harness, and terminal UI. |
-| `integrations/`       | Per-integration config normalization, verification, clients, helpers, store/catalog logic, the Hermes log pipeline, and per-vendor tool packages under `integrations/<vendor>/tools/`. |
-| `tools/`              | Tool registry, per-tool packages for cross-cutting tools that aren't vendor-specific (e.g. `tools/fleet_monitoring/`, `tools/watch_dog/`, `tools/sre_guidance_tool/`), and the interactive-shell action tools. Framework primitives (decorator, base class, utils) live in `core/tool_framework/`. |
-| `platform/`           | Cross-cutting platform services: guardrails, masking, sandbox, analytics, auth, notifications, observability, and EC2 deployment (`platform/deployment/`). |
-| `config/`             | Shared constants, prompts, UI theme, and the web app entrypoint (`config/webapp.py`).              |
-| `tests/`              | Unit, integration, synthetic, deployment, e2e, chaos engineering, and support tests.               |
-| `docs/`               | User-facing documentation, integration guides, and docs-site assets.                               |
-| `.github/`            | CI workflows, issue templates, pull request template, and repository automation.                   |
-| `Dockerfile`         | Optional production container image (FastAPI health app via uvicorn).                         |
-| `pyproject.toml`      | Python project metadata, dependency configuration, tooling, and package settings.                  |
-| `Makefile`            | Canonical local automation for install, test, verify, deploy, and cleanup targets.                 |
-| `README.md`           | Product overview, install, quick start, high-level capabilities, and links to deeper docs.         |
-| `docs/DEVELOPMENT.md` | Contributor workflows: CI parity commands, dev container, benchmark, deployment, telemetry detail. |
-| `docs/investigation-pipeline-architecture.md` | Investigation pipeline stages, ReAct loop control flow, and guardrails (tool cap, stagnation breaker, context budget), with diagrams. |
-| `docs/investigation-tool-calling.md` | Investigation ReAct tool schemas, LLM invoke payloads, and message shapes (all providers). |
-| `SETUP.md`            | Machine setup (all platforms, Windows, MCP/OpenClaw, troubleshooting).                             |
-| `CI.md`               | Mandatory pre-push checklist: lint, format, typecheck, tests — agents MUST follow before pushing. |
-| `TESTING.md`          | `ReplDriver` reference: API, usage patterns, wait-time guide, and limitations.                    |
-| `CONTRIBUTING.md`     | Contribution workflow, branch/PR guidance, and quality expectations.                               |
+| Path                                          | What it does                                                                                                                                                                                                                                                                                                                           |
+| --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `core/`                                       | Investigation orchestration, context assembly, the shared runtime tool-calling loop, and domain logic (state, types, correlation rules). Includes `core/tool_framework/` — the `BaseTool` base class, `@tool` decorator, registered-tool primitives, error telemetry, skill-guidance helpers, and shared payload utilities (`utils/`). |
+| `surfaces/cli/`                               | Command-line interface, onboarding wizard, local LLM helpers, and CLI tests support. Provider onboarding → `wizard/<provider>.py` (or `wizard/local_llm/`); new subcommands → `commands/<name>.py`. Runtime LLM wiring → [`core/llm/AGENTS.md`](core/llm/AGENTS.md).                                                                                                                                                                                                                                                   |
+| `surfaces/interactive_shell/`                 | Interactive terminal (REPL) loop, slash commands, chat/help surfaces, action-planning harness, and terminal UI.                                                                                                                                                                                                                        |
+| `integrations/`                               | Per-integration config normalization, verification, clients, helpers, store/catalog logic, the Hermes log pipeline, and per-vendor tool packages under `integrations/<vendor>/tools/`.                                                                                                                                                 |
+| `tools/`                                      | Tool registry, per-tool packages for cross-cutting tools that aren't vendor-specific (e.g. `tools/system/fleet_monitoring/`, `tools/system/watch_dog/`, `tools/system/sre_guidance_tool/`), and the interactive-shell action tools. Framework primitives (decorator, base class, utils) live in `core/tool_framework/`.                |
+| `platform/`                                   | Cross-cutting platform services: guardrails, masking, sandbox, analytics, auth, notifications, observability, harness ports (`platform/harness_ports.py`), and EC2 deployment (`platform/deployment/`).                                                                                                                                |
+| `config/`                                     | Shared constants, prompts, and UI theme.                                                                                                                                                                                                                                                                                               |
+| `tests/`                                      | Unit, integration, synthetic, deployment, e2e, chaos engineering, and support tests.                                                                                                                                                                                                                                                   |
+| `docs/`                                       | User-facing documentation, integration guides, and docs-site assets.                                                                                                                                                                                                                                                                   |
+| `.github/`                                    | CI workflows, issue templates, pull request template, and repository automation.                                                                                                                                                                                                                                                       |
+| `Dockerfile`                                  | Optional production container image (FastAPI health app via uvicorn).                                                                                                                                                                                                                                                                  |
+| `pyproject.toml`                              | Python project metadata, dependency configuration, tooling, and package settings.                                                                                                                                                                                                                                                      |
+| `Makefile`                                    | Canonical local automation for install, test, verify, deploy, and cleanup targets.                                                                                                                                                                                                                                                     |
+| `README.md`                                   | Product overview, install, quick start, high-level capabilities, and links to deeper docs.                                                                                                                                                                                                                                             |
+| `docs/DEVELOPMENT.md`                         | Contributor workflows: CI parity commands, dev container, benchmark, deployment, telemetry detail.                                                                                                                                                                                                                                     |
+| `docs/ARCHITECTURE.md`                        | Package architecture: the four-tier layer table, folder diagram, per-layer responsibilities, allowed cross-layer edges, and cross-layer flows.                                                                                                                                                                                         |
+| `docs/investigation-pipeline-architecture.md` | Investigation pipeline stages, ReAct loop control flow, and guardrails (tool cap, stagnation breaker, context budget), with diagrams.                                                                                                                                                                                                  |
+| `docs/investigation-tool-calling.md`          | Investigation ReAct tool schemas, LLM invoke payloads, and message shapes (all providers).                                                                                                                                                                                                                                             |
+| `docs/tool-placement-policy.md`               | Decision rule for where a tool lives: `integrations/<vendor>/tools/` vs. `tools/system/` vs. `tools/cross_vendor/` vs. `surfaces/shared/`.                                                                                                                                                                                             |
+| `docs/NAMING.md`                              | Naming conventions for `core/`: the glossary (State/Snapshot/RunInput/RunResult/Slice/Resources/Budget), the `{domain}_{role}.py` file rule, type naming (`Mixin` suffix, role-named Protocols, no package-name prefix), and anti-patterns.                                                                                            |
+| `SETUP.md`                                    | Machine setup (all platforms, Windows, MCP/OpenClaw, troubleshooting).                                                                                                                                                                                                                                                                 |
+| `CI.md`                                       | Mandatory pre-push checklist: lint, format, typecheck, tests — agents MUST follow before pushing.                                                                                                                                                                                                                                      |
+| `CONTRIBUTING.md`                             | Contribution workflow, branch/PR guidance, and quality expectations.                                                                                                                                                                                                                                                                   |
 
 Main packages one level deeper:
 
 - `platform/analytics/` — Analytics event plumbing and install helpers used by the onboarding flow.
 - `platform/auth/` — JWT and authentication helpers for local and hosted runtime access.
-- `surfaces/cli/` — Command-line interface, onboarding wizard, local LLM helpers, and CLI tests support.
-- `surfaces/interactive_shell/` — Interactive terminal (TTY) loop, slash-command surface, chat/help handoff, session runtime, and terminal UI. REPL watchdog slash commands (`/watch`, `/watches`, `/unwatch`): PR demo steps live under **Interactive shell: REPL watchdog demo** in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#interactive-shell-repl-watchdog-demo).
+- `surfaces/interactive_shell/` — REPL watchdog slash commands (`/watch`, `/watches`, `/unwatch`): PR demo steps live under **Interactive shell: REPL watchdog demo** in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#interactive-shell-repl-watchdog-demo).
 - `config/constants/` — Shared prompt and other static constants.
-- `core/context/` — Context assembly boundary for building, trimming, ranking, and packaging incident evidence before agent/runtime consumption.
 - `platform/deployment/aws/` — Shared boto3 client factory, deployment constants (`config.py`), VPC/subnet/SG helpers, EC2/IAM provisioning, ECR build/push, and SSM run-command primitives. Import from here in deployment scripts instead of duplicating.
 - `platform/deployment/` — EC2 deploy/destroy: `opensre-web` and `opensre-gateway` on one instance. Makefile: `make deploy`.
 - `platform/guardrails/` — Guardrail rules, evaluation engine, audit helpers, and CLI bindings.
-- `integrations/` — Integration config normalization, verification, selectors, clients, integration-local helpers, store, and catalog logic.
+- `platform/harness_ports.py` — Harness port layer (integration resolution, tool registry, investigation tools, GitHub repo scope). Real implementations are wired at startup via `integrations/harness_adapters.py` and `tools/harness_adapters.py` through `install_harness_ports()` in `surfaces/interactive_shell/ui/output/boundary.py`. See `core/agent_harness/AGENTS.md` for the import boundary.
 - `integrations/hermes/` — Hermes log tailing, incident classification, correlator, sinks, and investigation bridge.
 - `integrations/llm_cli/` — Subprocess-backed LLM CLIs (e.g. Codex). Extension guide: `integrations/llm_cli/AGENTS.md`.
 - `platform/masking/` — Masking utilities for redacting or normalizing sensitive content.
 - `tools/investigation/` — Composite investigation capability, public entrypoints, semantic stages, and reporting.
-- `core/` — Shared LLM tool-calling loop (execute tools, message shaping, context budget).
 - `core/llm/` — Hosted LLM provider clients, retry/schema helpers, and investigation tool-calling adapters.
 - `platform/sandbox/` — Sandboxed execution helpers for controlled runtime actions.
-- `core/context/state/` — Shared agent runtime envelope (`AgentState`), chat slice, investigation pipeline slice contracts, `EvidenceEntry`, state-update helpers, and pure defaults.
-- `tools/` — Tool registry, decorator, base classes, per-tool packages, shared utilities, and registry helpers.
+- `core/state/` — Shared agent runtime envelope (`AgentState`), chat slice, investigation pipeline slice contracts, `EvidenceEntry`, state-update helpers, and pure defaults.
 - `core/domain/types/` — Shared typed contracts for evidence, retrieval, and tool-related payloads.
-- `platform/` — Guardrails, masking, sandbox, analytics, auth, and cross-cutting platform services (e.g. `platform/notifications/telegram_delivery.py`).
-- `tools/watch_dog/` — Watchdog feature: per-threshold Telegram alarm dispatch with cooldown, sitting on top of `platform/notifications/telegram_delivery.py`.
-- `config/webapp.py` — Web-facing application entrypoint; the `opensre` CLI is `surfaces/cli/__main__.py`.
+- `tools/system/watch_dog/` — Watchdog feature: per-threshold Telegram alarm dispatch with cooldown, sitting on top of `integrations/telegram/*`.
+- `gateway/http/webapp.py` — Web-facing health app served by the gateway daemon; the `opensre` CLI is `surfaces/cli/__main__.py`.
 
 ## 2. Entry Points
 
 ### Adding a Tool
 
-The tool registry auto-discovers modules under `tools/`, so the normal path is to add one module or package there and let discovery pick it up.
-
-Files to touch:
-
-- `integrations/<vendor>/tools/<tool_name>_tool/__init__.py` when the tool belongs to an existing vendor integration (most common path).
-- `tools/<ToolName>/__init__.py` only when the tool is not vendor-specific (e.g. cross-cutting helpers such as `tools/sre_guidance_tool/`).
-- `core/tool_framework/utils/` if the tool needs shared helper code reused across vendors.
-- `integrations/<name>/client.py` if the tool should reuse a dedicated integration API client instead of inlining requests.
-- `docs/<tool_name>.mdx` for user-facing usage, parameters, and examples.
-- `docs/docs.json` — add the page path (without `.mdx`) to the appropriate `pages` array so Mintlify navigation includes it.
-- `tests/tools/test_<tool_name>.py` for behavior and regression coverage.
+The tool registry auto-discovers modules under `tools/`, so the normal path is to add one module or package there and let discovery pick it up. See [docs/adding-tools-and-integrations.md](docs/adding-tools-and-integrations.md) for the full file list and the detailed definition of done (package structure, contract/implementation rules, live-payload parsing, required docs/tests).
 
 Steps:
 
 1. Pick the simplest shape that fits the tool. Use a `BaseTool` subclass (from `core.tool_framework.base`) for richer behavior; use `@tool(...)` from `core.tool_framework.tool_decorator` for a lightweight function tool.
 2. Declare clear metadata: `name`, `description`, `source`, `input_schema`, and any `use_cases`, `requires`, `outputs`, or `retrieval_controls` you need.
-3. Treat tool packages as production code, not registry placeholders. A tool package may not be an empty or nearly-empty `__init__.py` whose only purpose is discovery. Directionally, non-trivial tools should use focused sibling modules such as `tool.py`, `client.py`/`delivery.py`, `validation.py`, `models.py`, or `results.py`; `__init__.py` should usually be a small registry entrypoint that imports the public tool object.
-4. Keep separation of concerns. Put reusable transport or integration-specific parsing code in `integrations/<name>/` or shared tool glue in `core/tool_framework/utils/` rather than copying it into the tool body. Split validation, credential/parameter resolution, dispatch/client calls, result normalization, and error handling into focused helpers or sibling files instead of tangling them inside `run()`.
-5. Return stable, planner-friendly results. Expected failures should produce a structured error shape; external side effects must declare `side_effect_level`, require approval when appropriate, and avoid leaking secrets through `extract_params`, return values, logs, or traceable tool-call kwargs.
-6. If the tool should appear in both investigation and chat surfaces, set `surfaces=("investigation", "chat")`.
-7. Add tests that cover schema shape, availability, extraction, success, failure, and the runtime behavior that the planner depends on.
-8. Before opening or approving the PR, follow [TOOL_INTEGRATION_CHECKLIST.md](TOOL_INTEGRATION_CHECKLIST.md) for tool/integration-specific wiring, payload, docs, and regression checks.
+3. Before opening or approving the PR, follow [docs/adding-tools-and-integrations.md](docs/adding-tools-and-integrations.md).
 
 ### Changing the investigation pipeline
 
@@ -106,13 +170,13 @@ for the end-to-end stage/loop diagrams before making structural changes.
 Files to touch:
 
 - `tools/investigation/lifecycle.py` for high-level stage ordering.
-- `core/context/` for shared context assembly, trimming, ranking, and evidence-envelope logic
-  that runs before agent/runtime consumption.
+- `core/state/` for shared agent state and investigation pipeline slice contracts
+  that cross stage boundaries.
 - `core/domain/` for pure investigation rules (alert source mapping, tool planning,
   category alignment, correlation scoring).
 - `core/` for shared LLM runtime helpers (tool loop and LLM invoke error
   classification).
-- `core/context/state/*.py` when adding or renaming persisted investigation fields
+- `core/state/*.py` when adding or renaming persisted investigation fields
   (update `AgentStateModel` and the matching slice).
 - `docs/` — update or add a page if the change introduces user-visible behavior or configuration.
 - `tests/` coverage for the affected CLI, synthetic, or integration paths.
@@ -125,108 +189,22 @@ Steps:
 
 ### Adding an Integration
 
-Integration work usually spans config normalization, verification, integration-local clients/helpers, tools, docs, and tests.
+Integration work usually spans config normalization, verification, integration-local clients/helpers, tools, docs, and tests. See [docs/adding-tools-and-integrations.md](docs/adding-tools-and-integrations.md) for the full file list, examples from the repo (Datadog, Grafana, Hermes), and the detailed definition of done (core completeness, investigation wiring, docs/tests, `make verify-integrations`, final demo gate).
 
-Files to touch:
-
-- `integrations/<name>/__init__.py` for config builders, validators, selectors, and normalization helpers.
-- `integrations/<name>/client.py` when the integration needs a dedicated API client.
-- `integrations/<name>/verifier.py` when the integration needs local verification logic.
-- `integrations/catalog.py` when the new integration must be resolved into the shared runtime config.
-- `integrations/verify.py` when the integration needs a local verification path.
-- `tools/<Name>Tool/` or `tools/<tool_file>.py` for the user-facing tool layer, or
-  `integrations/<name>/tools/` when consolidating a vendor's tools under its integration package.
-- `docs/<name>.mdx` for user-facing setup, usage, and verification docs.
-- `docs/docs.json` — add the page path (without `.mdx`) to the appropriate `pages` array so Mintlify navigation includes it.
-- `tests/integrations/test_<name>.py` for config, verification, and store coverage.
-- `tests/tools/test_<tool_name>.py` and any relevant `tests/e2e/` or `tests/synthetic/` files if the integration is exercised by tools or scenarios.
-
-Treat `integrations/` as the canonical user/config and external-client boundary, and `tools/` as the canonical agent-callable boundary. Do not add or import top-level `vendors/` or `services/` packages.
-
-Examples from the repo:
-
-- Datadog: `integrations/datadog/` (including `integrations/datadog/tools/` for query tools), `integrations/catalog.py`, and Datadog-related tests under `tests/integrations/datadog/` and `tests/tools/test_datadog_*.py`.
-- Grafana: `integrations/grafana/` (including `integrations/grafana/tools/` for query tools), `integrations/catalog.py`, `surfaces/cli/wizard/local_grafana_stack/`, and Grafana-related tests under `tests/integrations/grafana/` and `tests/tools/test_grafana_*.py`.
-- Hermes: `integrations/hermes/`, `tools/HermesLogsTool/`, `tools/HermesSessionEvidenceTool/`, `surfaces/cli/commands/hermes.py`, `tests/hermes/`, and `tests/synthetic/hermes/`.
-
-Basic steps:
+Steps:
 
 1. Add the integration config and normalization logic first so the rest of the stack can consume a consistent shape.
-2. Add or update the integration-local client only when the integration needs direct remote calls.
-3. Wire the tool layer after the config path is stable.
-4. Add docs and tests together so the integration is understandable and verifiable.
-5. Run `make verify-integrations` before treating the integration as complete.
-6. Before opening or approving the PR, follow [TOOL_INTEGRATION_CHECKLIST.md](TOOL_INTEGRATION_CHECKLIST.md) for integration completeness, investigation wiring, docs, and demo/test requirements.
+2. Wire the tool layer after the config path is stable.
+3. Before opening or approving the PR, follow [docs/adding-tools-and-integrations.md](docs/adding-tools-and-integrations.md).
 
-### Large multi-surface refactors
+## 3. Footguns (common mistakes to avoid)
 
-A consolidation refactor collapses behavior that has diverged across
-multiple surfaces (`interactive_shell/`, `gateway/`, `tools/investigation/`,
-`core/agent_harness/`, etc.) into one shared class or module — e.g. the
-`agent_harness` T-2/T-3 series (session management, integration resolution,
-startup consolidation). These are higher-risk than a normal feature or tool
-change: they touch several call sites at once and the source issue's file
-paths tend to be stale by the time work starts.
-
-Before starting this class of work, follow
-[REFACTOR_CHECKLIST.md](REFACTOR_CHECKLIST.md) — it covers dependency
-ordering, re-validating the issue against current repo state, incremental
-per-surface migration, and the import-boundary tests that must keep
-enforcing the new pattern.
-
-## 3. Rules (if X -> do Y)
-
-- If core agent or pipeline logic changes -> run `make test-cov` and `make typecheck`.
-- If a change consolidates or re-homes behavior across multiple surfaces (a "refactor" issue, not a localized fix) -> follow [REFACTOR_CHECKLIST.md](REFACTOR_CHECKLIST.md) before writing code and before opening the PR.
-- If a new feature is shipped (tool, CLI command, pipeline behavior, integration) -> add a `docs/` page or section covering usage, configuration, and examples before the PR is opened.
-- If a new `docs/` page is added or renamed -> register it in `docs/docs.json` under the correct `pages` array in the same PR (path without `.mdx`, e.g. `messaging/whatsapp` for `docs/messaging/whatsapp.mdx`).
-- If an existing feature changes behavior, flags, or config shape -> update the relevant `docs/` page in the same PR; docs and code must stay in sync.
-- When writing or editing a `docs/` page -> write for **users, not contributors**. Open with a command quick-reference table (command | what it does) if the page covers CLI commands. Follow with brief practical examples. Keep internal file formats, JSONL schemas, and implementation details out of user-facing pages — move those to `docs/DEVELOPMENT.md` or a contributor-only reference file if truly needed.
-- If a tool's API or schema changes -> update docs in `docs/` and update the related unit tests, usually under `tests/tools/`. For investigation LLM tool-calling (any provider), follow [docs/investigation-tool-calling.md](docs/investigation-tool-calling.md).
-- If adding or materially changing a tool/integration -> follow [TOOL_INTEGRATION_CHECKLIST.md](TOOL_INTEGRATION_CHECKLIST.md) in the same PR.
-- If an integration changes -> update `tests/integrations/` and verify with `make verify-integrations`.
-- If adding a new integration -> follow [TOOL_INTEGRATION_CHECKLIST.md](TOOL_INTEGRATION_CHECKLIST.md) before opening the PR for review.
-- If adding new tests -> place them in `tests/`, never inside the source packages (no inline tests), except gateway tests which intentionally live in `gateway/tests/` per `gateway/AGENTS.md`.
-- If CI-only tests are added -> mark them with the right pytest marker or place them in the appropriate e2e/synthetic/chaos folder so they do not run in the default local suite.
-- If investigation branching or loop behavior changes -> update `tools/investigation/lifecycle.py` and the tests for that path.
-- If adding or changing interactive REPL behavior (slash commands, session management, display output) -> use `ReplDriver` from `tests/utils/repl_driver.py` for live verification alongside unit tests; see [TESTING.md](TESTING.md).
-- If pushing or creating a PR -> follow the full pre-push checklist in [CI.md](CI.md).
-
-## 4. Testing
-
-Test commands, turn-handling rules, CI-only paths: **[CI.md](CI.md)**. Live REPL testing with `ReplDriver`: **[TESTING.md](TESTING.md)**.
-
-## 5. Footguns (common mistakes to avoid)
-
-- No planning-stage fail-closed safeguard (v0.1): the interactive-shell action planner never denies a turn with "I couldn't safely decide actions". All terminal actions are read-only, so unmatched/ambiguous/chatty clauses run what they can and fall through to the assistant. Do **not** reintroduce a planner denial, the `mark_unhandled` tool, or the `UNHANDLED:` convention. Rationale and details: `core/agent_harness/AGENTS.md` and `docs/interactive-shell-action-policy.md`. If mutating actions are ever added, gate them at the execution stage (`tools/interactive_shell/shared/execution_policy.py`), not the planner.
-- Vendored deps: No obvious vendored third-party dependencies are present. Python dependencies are managed in `pyproject.toml`, and the docs site has its own `docs/package.json` and `docs/pnpm-lock.yaml`. Do not vendor new libraries unless there is a strong reason.
-- Secrets: Never commit `.env` - always use `.env.example` as the template. Use read-only credentials for production integrations.
-- CI-only tests: Some e2e tests, including Kubernetes, EKS, and chaos engineering paths, require live infrastructure and are excluded from `make test-cov`. Do not expect them to pass locally without that environment.
-- Legacy graph dev server: removed; use `make dev` for a local uvicorn hint or run investigations via the CLI.
-- Docker requirement: Several targets, including the Grafana local stack and Chaos Mesh workflows, require a running Docker daemon.
+- No planning-stage fail-closed safeguard (v0.1): the interactive-shell action planner never denies a turn — do **not** reintroduce a planner denial, `mark_unhandled`, or the `UNHANDLED:` convention. Full rationale: [docs/interactive-shell-action-policy.md](docs/interactive-shell-action-policy.md); package rule: `surfaces/interactive_shell/AGENTS.md` ("Action Selection And Execution").
 - Docs navigation: Adding an `.mdx` file under `docs/` is not enough — Mintlify only shows pages listed in `docs/docs.json`. Forgetting the `pages` entry leaves the doc unreachable from the site sidebar.
 - Investigation tool schemas: draft-07 JSON Schema (e.g. `"type": ["object", "null"]`) can pass loose checks but fail the LLM API on first invoke because **all** available investigation tools are sent together. Normalize in the provider adapter and extend registry contract tests; see [docs/investigation-tool-calling.md](docs/investigation-tool-calling.md).
-- External-system code: `integrations/` owns config, clients, verifiers, and integration-local helpers; `tools/` owns every `@tool(...)` function and `BaseTool` class. Do not reintroduce top-level `vendors/` or `services/` packages.
-- Compatibility shims: Do not leave modules whose only job is to re-export symbols from a new
-  location. Update callers to the canonical module and delete the old path.
-- Empty or monolithic tool packages: Do not add a `tools/<name>/__init__.py`
-  that exists only to make discovery pass, and do not hide a non-trivial tool
-  implementation entirely in `__init__.py`. Use sibling modules for validation,
-  models, delivery/client calls, result shaping, and error handling whenever the
-  tool is more than a small function. Every tool must meet the implementation
-  and quality standards in the Adding a Tool section and
-  [TOOL_INTEGRATION_CHECKLIST.md](TOOL_INTEGRATION_CHECKLIST.md).
-- Interactive-shell action selection: do not implement regex/keyword/fuzzy
-  intent routing, literal slash-command shortcuts, or deterministic action
-  bypasses around the action-agent AgentTool path. Engineers have been fired
-  before for implementing this exact shortcut. The runtime's literal-`/slash`
-  detection (`input_policy._literal_slash_command_text`) is terminal UI policy
-  only (spinner/stdin gating), not an execution path.
+- Interactive-shell action selection: do not implement regex/keyword/fuzzy intent routing or deterministic action bypasses around the action-agent path. See `surfaces/interactive_shell/AGENTS.md` ("Action Selection And Execution") for the full rule and the sanctioned literal-`/slash` exception.
+- Information exposure through an exception (CWE-209 / CodeQL `py/stack-trace-exposure`): never send an exception's detail — `str(exc)`, `repr(exc)`, `traceback.format_exc()`, `exc.args`, provider/model/field internals — to an **external surface**. External surfaces are HTTP responses (`JSONResponse`/`HTTPException.detail` in `gateway/http/`) and chat gateway messages delivered to Slack/Telegram users (`OutputSink.render_error` on the gateway sinks). Log full detail server-side (`logger` + `capture_exception`) and return a generic message or `type(exc).__name__` only. The local CLI/terminal sink is **not** external — it may show detail. Redact at the sink/response boundary, not per call site, so the shared turn engine keeps detail for local dev.
+- Cyclic imports (CodeQL `py/cyclic-import`): CodeQL counts **function-local** and `TYPE_CHECKING` imports as part of a cycle, so making an import lazy does **not** clear the alert. Break the cycle structurally — move the shared symbol (type, exception, helper) into a **leaf** module both sides import, and never add a back-edge from a lower-level module up to a higher-level one. Precedent: `surfaces/cli/wizard/validation_result.py` and `surfaces/cli/llm_auth/persist.py` exist only to hold shared symbols so `validation` ↔ `azure_openai` and `_ui` → `service` stay acyclic.
+- CodeQL does not model `NoReturn`: it treats `pytest.skip`, `pytest.fail`, `sys.exit`, `typer.Exit` and custom raise-helpers as if they return, so any code after them looks reachable. Two alerts come from this — `py/uninitialized-local-variable` when a name is bound in `try` and the `except` only calls such a function, and unreachable-code when a `with` body ends in a bare `raise`. Do **not** silence with a comment: bind the name on every path CodeQL can see. Prefer a sentinel over exception control flow for ordinary "not found" — `next(iterable, None)` plus an explicit `if x is None:` guard, not `try: next(...) except StopIteration:`. `mypy` narrows correctly after the guard because it *does* honour `NoReturn`. For the bare-`raise` case, extract a `_raise()` helper.
+- CI typecheck does **not** cover `tests/`: `make typecheck` runs mypy over `PYTHON_SOURCE_PATHS` (`config core gateway integrations platform surfaces tools`) only. Type errors in test files never fail CI, so do not assume a clean `make typecheck` means the tests you just wrote are type-clean — run mypy on the test path directly when it matters.
 
-## 6. New Integration Checklist
-
-Follow [TOOL_INTEGRATION_CHECKLIST.md](TOOL_INTEGRATION_CHECKLIST.md) — it is the single definition of done for all tool and integration work.
-
-## 7. Large Refactor Checklist
-
-Follow [REFACTOR_CHECKLIST.md](REFACTOR_CHECKLIST.md) — it is the single definition of done for refactors that consolidate or re-home behavior across multiple surfaces (see "Large multi-surface refactors" above).

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from core.agent_harness.session.background import BackgroundInvestigationRecord
-from integrations.smtp.delivery import format_background_rca_email, send_smtp_report
+from surfaces.interactive_shell.session.background_investigations import (
+    BackgroundInvestigationRecord,
+)
 
 
 def deliver_background_notifications(
@@ -12,12 +13,36 @@ def deliver_background_notifications(
     channels: tuple[str, ...],
 ) -> dict[str, str]:
     """Send configured notifications for a completed background RCA."""
+    # Imported lazily: email delivery only fires on background-RCA completion, so
+    # the SMTP client must not load into the base REPL boot import path.
+    from integrations.smtp.delivery import format_background_rca_email, send_smtp_report
+
     results: dict[str, str] = {}
     from integrations.catalog import resolve_effective_integrations
 
     effective_integrations = resolve_effective_integrations()
 
     for channel in channels:
+        if channel == "telegram":
+            # Imported lazily: telegram delivery only fires on background-RCA
+            # completion, so the telegram client must not load into the base
+            # REPL boot import path.
+            from surfaces.interactive_shell.runtime.background.telegram_channel import (
+                deliver_telegram_notification,
+            )
+
+            results["telegram"] = deliver_telegram_notification(record)
+            continue
+
+        if channel == "rocketchat":
+            # Imported lazily for the same reason as the telegram channel.
+            from surfaces.interactive_shell.runtime.background.rocketchat_channel import (
+                deliver_rocketchat_notification,
+            )
+
+            results["rocketchat"] = deliver_rocketchat_notification(record)
+            continue
+
         if channel != "email":
             results[channel] = "unsupported"
             continue

@@ -4,18 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import logging
 import queue
 import threading
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from typing import TYPE_CHECKING, Any, cast
 
-from core.context.state import AgentState
+from config.constants.investigation import MAX_INVESTIGATION_LOOPS
 from core.domain.stream import StreamEvent
-from platform.observability.errors import report_and_reraise
-from platform.observability.sentry_sdk import init_sentry
+from core.state import AgentState
+from platform.observability.errors.boundary import report_and_reraise
+from platform.observability.errors.sentry import init_sentry
+from platform.observability.trace.spans import stage_span
 from tools.investigation.state_factory import make_initial_state
-from tools.investigation.streaming import resolved_integrations_stream_payload
+from tools.investigation.streaming import (
+    InvestigationPipelineStreamError,
+    resolved_integrations_stream_payload,
+)
 
 if TYPE_CHECKING:
     # Type-only — avoids paying the agent module's heavy import cost at
@@ -45,22 +51,33 @@ def _capture_exception_once(
 ) -> None:
     if _exception_was_captured(exc):
         return
-    from platform.observability.sentry_sdk import capture_exception
+    from platform.observability.errors.sentry import capture_exception
 
     capture_exception(exc, context=context, tags=tags)
     _mark_exception_captured(exc)
 
 
-def _traced_node(node_name: str, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+def _loop_metrics_for_error(state: Mapping[str, Any] | None) -> tuple[int, int]:
+    """Return ``(loop_count, iteration_cap)`` for error delivery; never raises."""
     try:
-        return fn(*args, **kwargs)
-    except Exception as exc:
-        _capture_exception_once(
-            exc,
-            context=f"node.{node_name}",
-            tags={"surface": "node", "node": node_name},
-        )
-        raise
+        from platform.analytics.investigation_loop import loop_metrics_from_state
+
+        return loop_metrics_from_state(state)
+    except Exception:
+        return 0, MAX_INVESTIGATION_LOOPS
+
+
+def _traced_node(node_name: str, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    with stage_span(node_name):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            _capture_exception_once(
+                exc,
+                context=f"node.{node_name}",
+                tags={"surface": "node", "node": node_name},
+            )
+            raise
 
 
 def run_investigation(
@@ -69,7 +86,7 @@ def run_investigation(
     resolved_integrations: dict[str, Any] | None = None,
     openclaw_context: dict[str, Any] | None = None,
     opensre_evaluate: bool = False,
-    investigation_metadata: tuple[str, str, str] | None = None,
+    investigation_metadata: tuple[str, str] | None = None,
     agent_class: type[ConnectedInvestigationAgent] | None = None,
 ) -> AgentState:
     """Run the investigation from a raw alert payload. Pure function: inputs in, state out.
@@ -79,8 +96,7 @@ def run_investigation(
         resolved_integrations: Optional pre-resolved integrations dict. When provided,
             integration resolution is skipped — useful for synthetic testing where a
             FixtureGrafanaBackend should be injected without real credential resolution.
-        investigation_metadata: Optional ``(alert_name, pipeline_name, severity)`` for
-            initial state; avoids copying those fields onto ``raw_alert``.
+        investigation_metadata: Optional ``(alert_name, severity)`` for AgentState.
         agent_class: Optional override for the investigation agent class. Defaults
             to ``ConnectedInvestigationAgent``. Callers that need a custom
             termination policy, structured-stage progression, or other
@@ -97,27 +113,32 @@ def run_investigation(
     if resolved_integrations is not None:
         cast(dict[str, Any], initial)["resolved_integrations"] = resolved_integrations
     if openclaw_context:
-        cast(dict[str, Any], initial)["openclaw_context"] = dict(openclaw_context)
+        from core.state.channel_context import set_channel_context
+
+        set_channel_context(cast(dict[str, Any], initial), "openclaw", openclaw_context)
 
     with report_and_reraise(
         logger=logger,
         message="run_investigation failed",
         tags={"surface": "pipeline", "component": "tools.investigation.capability"},
     ):
-        return _run(initial, agent_class=agent_class)
+        from platform.analytics.investigation_loop import bind_investigation_loop_metrics_from_state
+
+        state = _run(initial, agent_class=agent_class)
+        bind_investigation_loop_metrics_from_state(state)
+        return state
 
 
 def resolve_investigation_context(
     *,
     raw_alert: dict[str, Any],
     alert_name: str | None,
-    pipeline_name: str | None,
     severity: str | None,
-) -> tuple[str, str, str]:
-    """Resolve ``(alert_name, pipeline_name, severity)`` from overrides and payload defaults.
+) -> tuple[str, str]:
+    """Resolve ``(alert_name, severity)`` from overrides and payload defaults.
 
-    Pure helper shared by every delivery surface (CLI, HTTP server, MCP); overrides win,
-    then the raw alert's own fields, then common labels, then sensible fallbacks.
+    Pure helper shared by every delivery surface (CLI, HTTP server, MCP);
+    overrides win, then the raw alert's own fields, then common labels.
     """
     labels = raw_alert.get("commonLabels") or raw_alert.get("labels") or {}
     labels = labels if isinstance(labels, dict) else {}
@@ -130,13 +151,6 @@ def resolve_investigation_context(
         or canonical.get("alert_name")
         or labels.get("alertname")
         or "Incident",
-        pipeline_name
-        or raw_alert.get("pipeline_name")
-        or canonical.get("pipeline_name")
-        or labels.get("pipeline_name")
-        or labels.get("pipeline")
-        or labels.get("service")
-        or "unknown",
         severity
         or raw_alert.get("severity")
         or canonical.get("severity")
@@ -188,7 +202,7 @@ def run_investigation_payload(
     *,
     raw_alert: str | dict[str, Any],
     opensre_evaluate: bool = False,
-    investigation_metadata: tuple[str, str, str] | None = None,
+    investigation_metadata: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     """Run an investigation and return the serializable result payload.
 
@@ -197,8 +211,7 @@ def run_investigation_payload(
     CLI produces without depending on the ``cli`` package, so callers no longer have
     to reach up into ``cli.investigation`` to run an investigation.
 
-    ``investigation_metadata`` is an optional ``(alert_name, pipeline_name, severity)``
-    tuple for initial state (e.g. HTTP request overrides) without mutating ``raw_alert``.
+    ``investigation_metadata`` is an optional ``(alert_name, severity)`` tuple.
     """
     state = run_investigation(
         raw_alert,
@@ -212,7 +225,7 @@ async def astream_investigation(
     raw_alert: str | dict[str, Any],
     *,
     opensre_evaluate: bool = False,
-    investigation_metadata: tuple[str, str, str] | None = None,
+    investigation_metadata: tuple[str, str] | None = None,
 ) -> AsyncIterator[Any]:
     """Stream investigation events in real time.
 
@@ -287,16 +300,15 @@ async def astream_investigation(
             )
 
     def _run_pipeline() -> None:
+        state = initial
         try:
-            from core.context.state.updates import apply_state_updates
+            from core.state.updates import apply_state_updates
             from tools.investigation.reporting.node import generate_report
             from tools.investigation.stages.diagnose import diagnose
             from tools.investigation.stages.gather_evidence import ConnectedInvestigationAgent
             from tools.investigation.stages.intake import extract_alert
             from tools.investigation.stages.plan_evidence import plan_actions
             from tools.investigation.stages.resolve_integrations import resolve_integrations
-
-            state = initial
 
             # --- resolve_integrations ---
             _put(_make_node_event("on_chain_start", "resolve_integrations", {}))
@@ -322,11 +334,7 @@ async def astream_investigation(
                 _make_node_event(
                     "on_chain_end",
                     "extract_alert",
-                    {
-                        "output": {
-                            k: state.get(k) for k in ("alert_name", "pipeline_name", "severity")
-                        }
-                    },
+                    {"output": {k: state.get(k) for k in ("alert_name", "severity")}},
                 )
             )
 
@@ -452,14 +460,25 @@ async def astream_investigation(
             )
 
         except Exception as exc:
+            loop_count, iteration_cap = _loop_metrics_for_error(state)
             _capture_exception_once(exc, context="pipeline.astream_investigation")
             with contextlib.suppress(RuntimeError):
-                loop.call_soon_threadsafe(event_queue.put_nowait, exc)
+                loop.call_soon_threadsafe(
+                    event_queue.put_nowait,
+                    InvestigationPipelineStreamError(
+                        cause=exc,
+                        loop_count=loop_count,
+                        iteration_cap=iteration_cap,
+                    ),
+                )
         finally:
             with contextlib.suppress(RuntimeError):
                 loop.call_soon_threadsafe(event_queue.put_nowait, None)
 
-    thread = threading.Thread(target=_run_pipeline, daemon=True)
+    # Copy the caller's context so ContextVar bindings (session trace) reach the thread.
+    thread = threading.Thread(
+        target=contextvars.copy_context().run, args=(_run_pipeline,), daemon=True
+    )
     thread.start()
 
     while True:
@@ -472,6 +491,8 @@ async def astream_investigation(
 
         if item is None:
             break
+        if isinstance(item, InvestigationPipelineStreamError):
+            raise item
         if isinstance(item, BaseException):
             raise item
         yield item

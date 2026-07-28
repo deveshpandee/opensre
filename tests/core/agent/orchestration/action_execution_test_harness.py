@@ -8,7 +8,7 @@ from typing import Any
 
 from rich.console import Console
 
-from core.agent_harness.agents.action_agent import ToolCallingDeps
+from core.agent_harness.turns.action_driver import ToolCallingDeps
 from core.llm.types import AgentLLMResponse, ToolCall
 
 
@@ -79,5 +79,5 @@ def tool_response(name: str, args: dict[str, Any] | None = None) -> AgentLLMResp
     )
 
 
-def no_tool_response() -> AgentLLMResponse:
-    return AgentLLMResponse(content="", tool_calls=[], raw_content=None)
+def no_tool_response(content: str = "") -> AgentLLMResponse:
+    return AgentLLMResponse(content=content, tool_calls=[], raw_content=None)

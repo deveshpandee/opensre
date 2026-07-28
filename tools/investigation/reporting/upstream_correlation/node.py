@@ -3,12 +3,12 @@ from __future__ import annotations
 import logging
 from typing import Any, Protocol, cast
 
-from core.context.state import InvestigationState
 from core.domain.types.upstream import (
     UpstreamEvidenceBundle,
 )
+from core.state import InvestigationState
 from platform.observability import get_progress_tracker as get_tracker
-from platform.observability.tracing import traceable
+from platform.observability.trace.hook import traceable
 from tools.investigation.reporting.upstream_correlation.providers import (
     NoopUpstreamEvidenceProvider,
 )
@@ -89,12 +89,7 @@ def node_correlate_upstream(
             return {"correlation": existing}
 
     raw_alert = _raw_alert_dict(state)
-    service_name = str(
-        raw_alert.get("service")
-        or raw_alert.get("service_name")
-        or state.get("pipeline_name")
-        or "unknown"
-    )
+    service_name = str(raw_alert.get("service") or raw_alert.get("service_name") or "unknown")
     alert_id = str(raw_alert.get("id") or raw_alert.get("alert_id") or "unknown")
     try:
         window_start, window_end = _incident_window(state)
